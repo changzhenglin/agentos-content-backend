@@ -1,0 +1,35 @@
+{
+  "name": "agentos-content-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "gen": "tsx scripts/gen-types.ts",
+    "sync": "tsx scripts/sync-schemas.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "tsc -p tsconfig.json",
+    "db:generate": "drizzle-kit generate --config=drizzle.config.ts"
+  },
+  "dependencies": {
+    "fastify": "^5",
+    "drizzle-orm": "^0.36",
+    "pg": "^8",
+    "@aws-sdk/client-s3": "^3",
+    "@aws-sdk/s3-request-presigner": "^3",
+    "ajv": "^8",
+    "ajv-formats": "^3"
+  },
+  "devDependencies": {
+    "typescript": "^5",
+    "tsx": "^4",
+    "vitest": "^2",
+    "pg-mem": "^3",
+    "drizzle-kit": "^0.30",
+    "@types/pg": "^8",
+    "@types/node": "^22",
+    "json-schema-to-typescript": "^15",
+    "@apidevtools/json-schema-ref-parser": "^11",
+    "@testcontainers/minio": "^12"
+  }
+}

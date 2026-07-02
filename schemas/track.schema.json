@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentos.dev/schemas/track.schema.json",
+  "title": "AgentOS Music Track",
+  "description": "Music track shape (title/artist/album/duration_ms). 当前为音乐内容特化（Theme G B-3）。content 通用化（支持 video 等）时此 shape 须重审/迁移回 music 层，见 Theme G spec §7 架构债披露。",
+  "type": "object",
+  "required": ["title", "artist", "duration_ms"],
+  "properties": {
+    "title": {"type": "string"},
+    "artist": {"type": "string"},
+    "album": {"type": "string"},
+    "duration_ms": {"type": "integer", "minimum": 1}
+  },
+  "additionalProperties": false
+}

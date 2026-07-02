@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.tmp-src/
+.tmp-dst/
+# 生成的 TS 类型须 commit（drift test 比对），不忽略

@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentos.dev/schemas/runtime-mode.schema.json",
+  "title": "AgentOS Runtime Mode",
+  "description": "Single source of truth for runtime_mode enum (Theme B, codex P2#7). Referenced by content-contract.schema.json + scenario-trace.schema.json via $ref; C header include/agentos/protocols/runtime_mode.h mirrors these string values (drift test enforces).",
+  "type": "string",
+  "enum": ["local-runtime", "remote-service"]
+}
