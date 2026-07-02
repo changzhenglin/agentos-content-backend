@@ -31,11 +31,11 @@
     "runtime_mode": {"$ref": "https://agentos.dev/schemas/runtime-mode.schema.json"}
   },
   "allOf": [
-    {"if": {"properties": {"kind": {"const": "content_query"}}}, "then": {"required": ["query", "candidates"]}},
-    {"if": {"properties": {"kind": {"const": "content_match"}}}, "then": {"required": ["match", "track"]}},
-    {"if": {"properties": {"kind": {"const": "content_stream"}}}, "then": {"required": ["stream_id", "track_id", "url", "auth", "format", "bitrate", "expires_at"]}},
-    {"if": {"properties": {"kind": {"const": "content_lyrics"}}}, "then": {"required": ["track_id", "lines"]}},
-    {"if": {"properties": {"kind": {"const": "content_metadata"}}}, "then": {"required": ["track_id", "title", "artist", "duration_ms"]}},
+    {"if": {"properties": {"kind": {"const": "content_query"}, "completion_state": {"const": "DONE"}}, "required": ["kind", "completion_state"]}, "then": {"required": ["query", "candidates"]}},
+    {"if": {"properties": {"kind": {"const": "content_match"}, "completion_state": {"const": "DONE"}}, "required": ["kind", "completion_state"]}, "then": {"required": ["match", "track"]}},
+    {"if": {"properties": {"kind": {"const": "content_stream"}, "completion_state": {"const": "DONE"}}, "required": ["kind", "completion_state"]}, "then": {"required": ["stream_id", "track_id", "url", "auth", "format", "bitrate", "expires_at"]}},
+    {"if": {"properties": {"kind": {"const": "content_lyrics"}, "completion_state": {"const": "DONE"}}, "required": ["kind", "completion_state"]}, "then": {"required": ["track_id", "lines"]}},
+    {"if": {"properties": {"kind": {"const": "content_metadata"}, "completion_state": {"const": "DONE"}}, "required": ["kind", "completion_state"]}, "then": {"required": ["track_id", "title", "artist", "duration_ms"]}},
     {"if": {"properties": {"capability_mode": {"const": "mock"}}, "required": ["capability_mode"]}, "then": {"properties": {"completion_state": {"enum": ["DONE_WITH_CONCERNS", "BLOCKED", "NEEDS_CONTEXT"]}}}},
     {"if": {"properties": {"capability_mode": {"const": "unavailable"}}, "required": ["capability_mode"]}, "then": {"properties": {"completion_state": {"enum": ["BLOCKED", "NEEDS_CONTEXT"]}}}},
     {"if": {"properties": {"capability_mode": {"const": "degraded"}}, "required": ["capability_mode"]}, "then": {"properties": {"completion_state": {"enum": ["DONE_WITH_CONCERNS", "BLOCKED", "NEEDS_CONTEXT"]}}}},
