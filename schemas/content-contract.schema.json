@@ -31,6 +31,7 @@
     "runtime_mode": {"$ref": "https://agentos.dev/schemas/runtime-mode.schema.json"}
   },
   "allOf": [
+    {"$comment": "业务字段（query/candidates/match/track/stream_id/url/auth/lines/title 等）仅在 completion_state=DONE 时 required；no_result/blocked envelope 无业务字段亦 schema-valid（M2a T7 暴露的 allOf 缺陷修复，PR#40）"},
     {"if": {"properties": {"kind": {"const": "content_query"}, "completion_state": {"const": "DONE"}}, "required": ["kind", "completion_state"]}, "then": {"required": ["query", "candidates"]}},
     {"if": {"properties": {"kind": {"const": "content_match"}, "completion_state": {"const": "DONE"}}, "required": ["kind", "completion_state"]}, "then": {"required": ["match", "track"]}},
     {"if": {"properties": {"kind": {"const": "content_stream"}, "completion_state": {"const": "DONE"}}, "required": ["kind", "completion_state"]}, "then": {"required": ["stream_id", "track_id", "url", "auth", "format", "bitrate", "expires_at"]}},
