@@ -15,16 +15,14 @@ export interface QueryCandidate {
 }
 
 export interface MatchResult {
-  match: { title: string; artist: string; isrc: string | null };
+  // match: schema $defs/match（track_id/title/artist/album/isrc，isrc 省略当 null）
+  match: { track_id: string; title: string; artist: string; isrc?: string };
+  // track: schema track.schema（title/artist/album/duration_ms，additionalProperties false）
   track: {
-    track_id: string;
     title: string;
     artist: string;
-    album: string | null;
     duration_ms: number;
-    cover_url: string | null;
-    format: string;
-    bitrate: number;
+    album?: string | null;
   };
 }
 
@@ -32,9 +30,10 @@ export interface MetadataResult {
   track_id: string;
   title: string;
   artist: string;
-  album: string | null;
   duration_ms: number;
-  cover_url: string | null;
+  // album/cover_url 省略当 null（schema 这些字段 type string，null 不符）
+  album?: string;
+  cover_url?: string;
 }
 
 interface TrackRow {
@@ -111,19 +110,21 @@ export async function matchTrack(
   }
   if (!row) return null;
   const t = toTrack(row);
-  return {
-    match: { title: t.title, artist: t.artist, isrc: t.isrc },
-    track: {
-      track_id: t.track_id,
-      title: t.title,
-      artist: t.artist,
-      album: t.album,
-      duration_ms: t.duration_ms,
-      cover_url: t.cover_url,
-      format: t.format,
-      bitrate: t.bitrate,
-    },
+  // matchPart: track_id + title + artist + isrc（省略 null，schema isrc type string）
+  const matchPart: MatchResult["match"] = {
+    track_id: t.track_id,
+    title: t.title,
+    artist: t.artist,
   };
+  if (t.isrc != null) matchPart.isrc = t.isrc;
+  // trackPart: 只 schema track.schema 允许字段（title/artist/album/duration_ms）
+  const trackPart: MatchResult["track"] = {
+    title: t.title,
+    artist: t.artist,
+    duration_ms: t.duration_ms,
+  };
+  if (t.album != null) trackPart.album = t.album;
+  return { match: matchPart, track: trackPart };
 }
 
 /**
@@ -140,12 +141,14 @@ export async function getMetadata(
   );
   const row = rows[0];
   if (!row) return null;
-  return {
+  const result: MetadataResult = {
     track_id: String(row.track_id),
     title: String(row.title),
     artist: String(row.artist),
-    album: row.album == null ? null : String(row.album),
     duration_ms: Number(row.duration_ms),
-    cover_url: row.cover_url == null ? null : String(row.cover_url),
   };
+  // album/cover_url 省略当 null（schema 这些字段 type string）
+  if (row.album != null) result.album = String(row.album);
+  if (row.cover_url != null) result.cover_url = String(row.cover_url);
+  return result;
 }

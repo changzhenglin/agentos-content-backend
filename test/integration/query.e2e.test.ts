@@ -19,7 +19,7 @@ describe("query e2e", () => {
   it("keyword 命中 title → ok + candidates", async () => {
     const db = createTestDb();
     await seedTrack(db, base);
-    const r = await queryBusiness(db, ["Sun"]);
+    const r = await queryBusiness(db, { keywords: ["Sun"] });
     expect(r.outcome).toBe("ok");
     expect(r.backendType).toBe("self_hosted");
     expect(r.business.candidates.length).toBe(1);
@@ -30,7 +30,7 @@ describe("query e2e", () => {
   it("keyword 命中 artist → ok", async () => {
     const db = createTestDb();
     await seedTrack(db, base);
-    const r = await queryBusiness(db, ["Foo"]);
+    const r = await queryBusiness(db, { keywords: ["Foo"] });
     expect(r.outcome).toBe("ok");
     expect(r.business.candidates[0].artist).toBe("Foo Fighters");
   });
@@ -38,15 +38,23 @@ describe("query e2e", () => {
   it("无命中 → no_result", async () => {
     const db = createTestDb();
     await seedTrack(db, base);
-    const r = await queryBusiness(db, ["Nonexistent"]);
+    const r = await queryBusiness(db, { keywords: ["Nonexistent"] });
     expect(r.outcome).toBe("no_result");
     expect(r.business.candidates.length).toBe(0);
   });
 
   it("空 keywords → 返回全部（no_result when 空 DB）", async () => {
     const db = createTestDb();
-    const r = await queryBusiness(db, []);
+    const r = await queryBusiness(db, { keywords: [] });
     expect(r.outcome).toBe("no_result");
     expect(r.business.candidates.length).toBe(0);
+  });
+
+  it("business 回显 query（schema content_query 要求 envelope 含 query）", async () => {
+    const db = createTestDb();
+    await seedTrack(db, base);
+    const r = await queryBusiness(db, { keywords: ["Sun"], intent: "search" });
+    expect(r.business.query.keywords).toEqual(["Sun"]);
+    expect(r.business.query.intent).toBe("search");
   });
 });

@@ -1,6 +1,7 @@
 // query.ts — query kind 业务 handler。
 // 调 queryTracks，返回 {outcome, backendType, capabilityMode, business}（路由层 wrap envelope）。
 // spec §5.1：candidates 非空 → ok；空 → no_result。
+// business 回显 query（schema content_query allOf 要求 envelope 含 query 字段）。
 // self_hosted only（third_party query 未授权走 selectPath fallback degraded，
 // 但 degraded 仍走 self_hosted 业务函数——M2d 前所有 query 均 self_hosted；
 // capabilityMode 由路由层 selectPath 决定，handler 对 self_hosted 路径固定 real）。
@@ -9,13 +10,21 @@ import type { ContentDb } from "../content/db.js";
 import type { CapabilityMode, ErrorCode } from "../envelope.js";
 import { queryTracks } from "../content/self-hosted.js";
 
-export async function queryBusiness(db: ContentDb, keywords: string[]) {
-  const business = await queryTracks(db, keywords);
+/** query 请求形状（schema $defs/query：keywords 必需，intent/fuzzy 可选）。 */
+export interface QueryRequest {
+  keywords: string[];
+  intent?: string;
+  fuzzy?: boolean;
+}
+
+export async function queryBusiness(db: ContentDb, query: QueryRequest) {
+  const result = await queryTracks(db, query.keywords);
+  // business 回显 query（content-contract schema content_query 要求 envelope 含 query）
   return {
-    outcome: business.candidates.length ? ("ok" as const) : ("no_result" as const),
+    outcome: result.candidates.length ? ("ok" as const) : ("no_result" as const),
     backendType: "self_hosted" as const,
     capabilityMode: "real" as CapabilityMode,
     errorCode: undefined as ErrorCode | undefined,
-    business,
+    business: { query, candidates: result.candidates },
   };
 }
