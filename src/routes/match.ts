@@ -3,6 +3,7 @@
 // spec §5.2：isrc/title 精确匹配。
 
 import type { ContentDb } from "../content/db.js";
+import type { CapabilityMode, ErrorCode } from "../envelope.js";
 import { matchTrack } from "../content/self-hosted.js";
 
 export async function matchBusiness(
@@ -14,12 +15,16 @@ export async function matchBusiness(
     return {
       outcome: "no_result" as const,
       backendType: "self_hosted" as const,
+      capabilityMode: "real" as CapabilityMode,
+      errorCode: undefined as ErrorCode | undefined,
       business: {},
     };
   }
   return {
     outcome: "ok" as const,
     backendType: "self_hosted" as const,
+    capabilityMode: "real" as CapabilityMode,
+    errorCode: undefined as ErrorCode | undefined,
     business,
   };
 }

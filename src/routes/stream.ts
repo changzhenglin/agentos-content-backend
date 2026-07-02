@@ -14,6 +14,7 @@ import type { ContentDb } from "../content/db.js";
 import { parseTrackId } from "../content/track-id.js";
 import { selectPath } from "../content/path-select.js";
 import { objectKey } from "../storage/presign.js";
+import type { CapabilityMode, ErrorCode } from "../envelope.js";
 
 export interface PresignFn {
   (key: string): Promise<{
@@ -25,6 +26,8 @@ export interface PresignFn {
 export interface StreamOk {
   outcome: "ok";
   backendType: "self_hosted" | "third_party_api";
+  capabilityMode: CapabilityMode;
+  errorCode?: ErrorCode;
   business: {
     stream_id: number;
     track_id: string;
@@ -38,11 +41,15 @@ export interface StreamOk {
 export interface StreamNoResult {
   outcome: "no_result";
   backendType: "self_hosted" | "third_party_api";
+  capabilityMode: CapabilityMode;
+  errorCode?: ErrorCode;
   business: Record<string, never>;
 }
 export interface StreamBlocked {
   outcome: "blocked";
   backendType: "self_hosted" | "third_party_api";
+  capabilityMode: CapabilityMode;
+  errorCode?: ErrorCode;
   business: Record<string, never>;
 }
 export type StreamOutcome = StreamOk | StreamNoResult | StreamBlocked;
@@ -67,6 +74,8 @@ export async function streamBusiness(
     return {
       outcome: "blocked",
       backendType: path.backendType,
+      capabilityMode: path.capabilityMode,
+      errorCode: path.errorCode,
       business: {},
     };
   }
@@ -79,6 +88,8 @@ export async function streamBusiness(
     return {
       outcome: "no_result",
       backendType: path.backendType,
+      capabilityMode: path.capabilityMode,
+      errorCode: path.errorCode,
       business: {},
     };
   }
@@ -87,6 +98,8 @@ export async function streamBusiness(
   return {
     outcome: "ok",
     backendType: path.backendType,
+    capabilityMode: path.capabilityMode,
+    errorCode: path.errorCode,
     business: {
       stream_id: Date.now(),
       track_id: trackId,

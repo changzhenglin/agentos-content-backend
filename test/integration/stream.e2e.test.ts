@@ -53,23 +53,42 @@ describe("stream e2e", () => {
     const r = await streamBusiness(db, mockPresign, "qq:song1");
     expect(r.outcome).toBe("blocked");
     expect(r.backendType).toBe("self_hosted"); // attempted self_hosted
+    // 透传 selectPath 的 capabilityMode + errorCode（解 M2）
+    expect(r.capabilityMode).toBe("unavailable");
+    expect(r.errorCode).toBe("COPYRIGHT_RESTRICTED");
   });
 
   it("envelope wrap + httpStatus 端到端（ok → DONE → 200）", async () => {
     const db = createTestDb();
     await seedTrack(db, base);
     const r = await streamBusiness(db, mockPresign, "self:t1");
-    const env = wrapEnvelope(r.business, "content_stream", r.backendType, "real", r.outcome);
+    // handler 透传 capabilityMode + errorCode（解 M2：不再手动传）
+    const env = wrapEnvelope(
+      r.business,
+      "content_stream",
+      r.backendType,
+      r.capabilityMode,
+      r.outcome,
+      r.errorCode,
+    );
     expect(env.completion_state).toBe("DONE");
     expect(env.error_code).toBeUndefined();
     expect(httpStatus(env.completion_state)).toBe(200);
     expect(env.url).toBe("https://mock.s3/self:t1:v1");
   });
 
-  it("envelope wrap（blocked → BLOCKED → 503）", async () => {
+  it("envelope wrap（blocked → BLOCKED → 503，errorCode 透传 COPYRIGHT_RESTRICTED）", async () => {
     const db = createTestDb();
     const r = await streamBusiness(db, mockPresign, "qq:song1");
-    const env = wrapEnvelope(r.business, "content_stream", r.backendType, "unavailable", r.outcome);
+    // handler 透传 capabilityMode + errorCode（selectPath unavailable + COPYRIGHT_RESTRICTED）
+    const env = wrapEnvelope(
+      r.business,
+      "content_stream",
+      r.backendType,
+      r.capabilityMode,
+      r.outcome,
+      r.errorCode,
+    );
     expect(env.completion_state).toBe("BLOCKED");
     expect(env.error_code).toBe("COPYRIGHT_RESTRICTED");
     expect(httpStatus(env.completion_state)).toBe(503);
