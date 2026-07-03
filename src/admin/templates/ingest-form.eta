@@ -1,0 +1,7 @@
+<form hx-post="/admin/ingest" hx-target="#ingest-result" hx-swap="innerHTML">
+<input name="track_id" placeholder="self:t1">
+<input name="audio_object_key" placeholder="k1">
+<textarea name="raw_metadata">{"title":"","artist":"","durationMs":0,"format":"mp3","bitrate":128000,"license":"CC"}</textarea>
+<button>入库</button>
+<% if (it.errs.length) { %><ul><% it.errs.forEach(e => { %><li class="error"><%= e %></li><% }) %></ul><% } %>
+</form><div id="ingest-result"></div>

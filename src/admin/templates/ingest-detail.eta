@@ -1,0 +1,10 @@
+<tr id="ingest-<%= it.ingest.id %>">
+<td><%= it.ingest.track_id %></td><td><%= it.ingest.state %></td>
+<td>
+<% if (it.ingest.state === 'pending') { %>
+<button hx-post="/admin/ingest/<%= it.ingest.id %>/approve" hx-target="#ingest-<%= it.ingest.id %>" hx-swap="outerHTML">approve</button>
+<button hx-post="/admin/ingest/<%= it.ingest.id %>/reject" hx-target="#ingest-<%= it.ingest.id %>" hx-swap="outerHTML">reject</button>
+<% } else if (it.ingest.state === 'approved') { %>已审核<% } else if (it.ingest.state === 'rejected') { %>已拒<% } %>
+<% if (it.ingest.state === 'approved' || it.ingest.state === 'revoked') { %>
+<button hx-post="/admin/ingest/<%= it.ingest.id %>/revoke" hx-target="#ingest-<%= it.ingest.id %>" hx-swap="outerHTML">revoke</button><% } %>
+</td></tr>

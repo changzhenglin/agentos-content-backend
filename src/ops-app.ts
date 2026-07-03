@@ -12,11 +12,26 @@
 // error body 统一 {error_code, message}（fold devex I3）。
 // actor 绑定 mTLS caller（不信 self-declared，fold codex P2）。
 import Fastify, { type FastifyInstance } from "fastify";
+import cookiePlugin from "@fastify/cookie";
+import staticPlugin from "@fastify/static";
+import { resolve } from "node:path";
 import type { ContentDb } from "./content/db.js";
 import type { PolicyEnvelope, PolicyStore } from "./policy/policy-store.js";
 import { createPolicyStore } from "./policy/policy-store.js";
 import type { AuditSink } from "./audit/audit-sink.js";
 import { emitConfigApply, emitUnauthorized } from "./audit/audit-events.js";
+import { createSession, requireRole } from "./auth/session.js";
+import {
+  validateRawMetadata,
+  ingestCreate,
+  ingestTransitionAndAudit,
+} from "./admin/ingest.js";
+import {
+  renderLogin,
+  renderTracksList,
+  renderIngestDetail,
+  renderIngestForm,
+} from "./admin/views.js";
 
 export interface TlsOpts {
   // 服务端自身 TLS 身份（key/cert）+ 校验 client cert 的 CA
@@ -155,6 +170,197 @@ export async function buildOpsApp(opts: BuildOpsAppOpts) {
     }
     return reply.code(200).send(r);
   });
+
+  // ---- T7 admin UI routes（/admin/*，htmx SSR + session，fold design C1/C3）----
+  // 仅当 adminToken 配置时挂载（sim 本地开发/生产；无 token 则 admin UI 不启用）
+  if (opts.adminToken) {
+    app.register(cookiePlugin);
+    app.register(staticPlugin, {
+      root: resolve(process.cwd(), "public"),
+      prefix: "/public/",
+    });
+
+    // htmx form 提交 content-type: application/x-www-form-urlencoded；
+    // Fastify 默认不注册该 content-type parser → 415（route handler 不执行）。
+    // 手写 parser（避免引入 @fastify/formbody 依赖），解析为 key/value 对象，
+    // 值均为 string（handler 内对 raw_metadata 再 JSON.parse 规范化，见下）。
+    app.addContentTypeParser(
+      "application/x-www-form-urlencoded",
+      { parseAs: "string" },
+      (_req, body, done) => {
+        const out: Record<string, string> = {};
+        for (const pair of String(body).split("&")) {
+          if (!pair) continue;
+          const eq = pair.indexOf("=");
+          const k = decodeURIComponent(eq < 0 ? pair : pair.slice(0, eq));
+          const v = decodeURIComponent(eq < 0 ? "" : pair.slice(eq + 1));
+          out[k] = v;
+        }
+        done(null, out);
+      },
+    );
+
+    // GET routes（fold design C3: login/ingests queue/ingest-detail/tracks）
+    app.get("/admin/login", async (_req, reply) =>
+      reply.type("text/html").send(renderLogin()),
+    );
+    app.get(
+      "/admin/ingests",
+      { preHandler: requireRole("operator") },
+      async (_req, reply) => {
+        const { rows } = await opts.db.query(
+          "SELECT id, track_id, state FROM ingest WHERE state='pending' ORDER BY created_at",
+        );
+        const items = rows.map((r: any) => ({
+          id: String(r.id),
+          track_id: String(r.track_id),
+          state: String(r.state),
+        }));
+        // pending queue：完整 HTML 页（含 htmx script，fold design C3），每行一个 ingest-detail partial
+        const table = items
+          .map((i: any) => renderIngestDetail(i))
+          .join("");
+        const html = `<!doctype html><html><head><meta charset="utf-8"><script src="/public/htmx.min.js"></script></head><body><h1>待审核 ingest</h1><table>${table}</table></body></html>`;
+        return reply.type("text/html").send(html);
+      },
+    );
+    app.get(
+      "/admin/ingest/:id",
+      { preHandler: requireRole("operator") },
+      async (req, reply) => {
+        const { rows } = await opts.db.query(
+          "SELECT id, track_id, state FROM ingest WHERE id=$1",
+          [(req.params as any).id],
+        );
+        if (!rows[0]) {
+          return reply
+            .code(404)
+            .send({ error_code: "NOT_FOUND", message: "ingest not found" });
+        }
+        return reply.type("text/html").send(
+          renderIngestDetail({
+            id: String(rows[0].id),
+            track_id: String(rows[0].track_id),
+            state: String(rows[0].state),
+          }),
+        );
+      },
+    );
+    app.get(
+      "/admin/tracks",
+      { preHandler: requireRole("operator") },
+      async (_req, reply) => {
+        const { rows } = await opts.db.query(
+          "SELECT track_id, title, artist FROM tracks",
+        );
+        return reply.type("text/html").send(renderTracksList(rows));
+      },
+    );
+
+    // POST routes
+    app.post("/admin/login", async (req, reply) => {
+      const { token } = req.body as any;
+      let role: "admin" | "operator" | null = null;
+      if (token === opts.adminToken) role = "admin";
+      else if (token === opts.operatorToken) role = "operator";
+      if (!role) {
+        return reply
+          .code(401)
+          .send({ error_code: "INVALID_TOKEN", message: "invalid token" });
+      }
+      const sid = createSession({ role, name: role });
+      // secure: App2 mTLS https（fold design M2）；httpOnly 防 XSS 取 cookie
+      reply.setCookie("sid", sid, {
+        httpOnly: true,
+        sameSite: "lax",
+        secure: true,
+      });
+      return reply.type("text/html").send(renderLogin()); // htmx 可替换
+    });
+
+    // ingest 入库：admin only。成功返 JSON {id,state,trackId}（e2e 链式取 id）；
+    // 400 返 HTML form partial 含错误（htmx 回填，fold design I3）。
+    app.post(
+      "/admin/ingest",
+      { preHandler: requireRole("admin") },
+      async (req, reply) => {
+        let { track_id, raw_metadata, audioObjectKey } = req.body as any;
+        // htmx form form-urlencoded 提交时 raw_metadata 是 JSON 字符串（Fastify 解析后）；
+        // 真实浏览器路径需在此规范化为 object 再校验，否则 validateRawMetadata
+        // 检 typeof !== "object" 恒 400（e2e 用 inject 传 object 绕过未触发）。
+        if (typeof raw_metadata === "string") {
+          try {
+            raw_metadata = JSON.parse(raw_metadata);
+          } catch {
+            return reply
+              .code(400)
+              .type("text/html")
+              .send(renderIngestForm(["raw_metadata invalid JSON"]));
+          }
+        }
+        const errs = validateRawMetadata(raw_metadata);
+        if (errs.length) {
+          return reply
+            .code(400)
+            .type("text/html")
+            .send(renderIngestForm(errs));
+        }
+        const r = await ingestCreate(
+          opts.db,
+          track_id,
+          raw_metadata,
+          audioObjectKey ?? null,
+        );
+        return reply.send({ id: r.id, state: r.state, trackId: r.trackId });
+      },
+    );
+
+    // approve/reject/revoke 返 HTML partial（hx-swap outerHTML，fold design C1）
+    // reject 显式 route（fold design I2，非 catch-all）
+    const transitionRoute = (action: "approve" | "reject" | "revoke") =>
+      app.post(
+        `/admin/ingest/:id/${action}`,
+        { preHandler: requireRole("admin") },
+        async (req, reply) => {
+          const ingestId = (req.params as any).id;
+          // transition 内 ingestId 不存在抛 NOT_FOUND（state-machine.ts），
+          // 此处 catch 转 404（避免 fastify 默认 500，fold fix #2）。
+          let trackId: string | null;
+          try {
+            ({ trackId } = await ingestTransitionAndAudit(
+              opts.db,
+              opts.auditSink,
+              ingestId,
+              action,
+              (req as any).user.name,
+            ));
+          } catch (e: any) {
+            if (e?.message === "NOT_FOUND") {
+              return reply
+                .code(404)
+                .send(errBody("NOT_FOUND", "ingest not found"));
+            }
+            throw e;
+          }
+          const state =
+            action === "approve"
+              ? "approved"
+              : action === "reject"
+                ? "rejected"
+                : "revoked";
+          return reply.type("text/html").send(
+            renderIngestDetail({
+              id: ingestId,
+              track_id: trackId ?? "",
+              state,
+            }),
+          );
+        },
+      );
+    transitionRoute("approve");
+    transitionRoute("reject");
+    transitionRoute("revoke");
+  }
 
   return app;
 }

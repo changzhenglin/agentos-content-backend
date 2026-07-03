@@ -48,6 +48,26 @@ export const CONTENT_POLICY_DDL = `CREATE TABLE IF NOT EXISTS content_policy (
 CREATE UNIQUE INDEX IF NOT EXISTS content_policy_cmd_uk ON content_policy(command_id);
 CREATE UNIQUE INDEX IF NOT EXISTS content_policy_rule_ver_uk ON content_policy(rule_id, version);`;
 
+// ingest/review：审核状态机依赖表（T7 admin UI e2e test fixture，②类必要支撑，
+// 与 test/unit/review-state.test.ts DDL 同结构）。
+export const INGEST_DDL = `CREATE TABLE IF NOT EXISTS ingest (
+  id text PRIMARY KEY,
+  track_id text NOT NULL,
+  source text NOT NULL,
+  raw_metadata text NOT NULL,
+  audio_object_key text,
+  state text NOT NULL DEFAULT 'pending',
+  created_at timestamp NOT NULL DEFAULT now()
+)`;
+
+export const REVIEW_DDL = `CREATE TABLE IF NOT EXISTS review (
+  id text PRIMARY KEY,
+  ingest_id text NOT NULL,
+  actor text NOT NULL,
+  action text NOT NULL,
+  at timestamp NOT NULL DEFAULT now()
+)`;
+
 export interface SeedTrack {
   track_id: string;
   title: string;
@@ -62,7 +82,7 @@ export interface SeedTrack {
   license: string;
 }
 
-export function createTestDb(opts: { withLyrics?: boolean } = {}): ContentDb {
+export function createTestDb(opts: { withLyrics?: boolean; withIngest?: boolean } = {}): ContentDb {
   const mem = newDb();
   const pg = mem.adapters.createPg();
   const pool = new pg.Pool();
@@ -75,6 +95,11 @@ export function createTestDb(opts: { withLyrics?: boolean } = {}): ContentDb {
   pool.query(TRACKS_DDL);
   if (opts.withLyrics) pool.query(LYRICS_DDL);
   pool.query(CONTENT_POLICY_DDL);
+  // T7 admin UI e2e 需 ingest/review 表（默认建，review-state 单测各自建不影响）
+  if (opts.withIngest !== false) {
+    pool.query(INGEST_DDL);
+    pool.query(REVIEW_DDL);
+  }
   return db;
 }
 
