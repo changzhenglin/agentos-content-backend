@@ -32,6 +32,22 @@ const LYRICS_DDL = `CREATE TABLE lyrics (
   UNIQUE (track_id, line_index)
 )`;
 
+// content_policy：ops-platform 下发策略表（M2b 消费侧），与 schema.ts 同结构
+export const CONTENT_POLICY_DDL = `CREATE TABLE IF NOT EXISTS content_policy (
+  id text PRIMARY KEY,
+  rule_id text NOT NULL,
+  action text NOT NULL,
+  target_scope text NOT NULL,
+  version integer NOT NULL,
+  envelope text NOT NULL,
+  caller_identity text NOT NULL,
+  command_id text NOT NULL,
+  received_at timestamptz NOT NULL DEFAULT now(),
+  superseded_by integer
+);
+CREATE UNIQUE INDEX IF NOT EXISTS content_policy_cmd_uk ON content_policy(command_id);
+CREATE UNIQUE INDEX IF NOT EXISTS content_policy_rule_ver_uk ON content_policy(rule_id, version);`;
+
 export interface SeedTrack {
   track_id: string;
   title: string;
@@ -58,6 +74,7 @@ export function createTestDb(opts: { withLyrics?: boolean } = {}): ContentDb {
   // 同步建表（pool.query 在 pg-mem 同步执行）
   pool.query(TRACKS_DDL);
   if (opts.withLyrics) pool.query(LYRICS_DDL);
+  pool.query(CONTENT_POLICY_DDL);
   return db;
 }
 

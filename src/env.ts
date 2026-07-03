@@ -13,6 +13,11 @@ export interface S3Config {
 export interface Env {
   dbUrl: string;
   s3: S3Config;
+  auditSinkPath: string;            // 新增：audit JSONL 路径
+  contentBackendRegion: string;     // 新增：D10 backend 自持 region
+  adminToken: string;               // 新增：sim admin dev token
+  operatorToken: string;            // 新增：sim operator dev token
+  opsPort: number;                  // 新增：App2 端口
 }
 
 export function loadEnv(overrides: Partial<Env> = {}): Env {
@@ -32,5 +37,10 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
         process.env.S3_SECRET_ACCESS_KEY ??
         "minioadmin",
     },
+    auditSinkPath: overrides.auditSinkPath ?? process.env.AUDIT_SINK_PATH ?? ".audit.jsonl",
+    contentBackendRegion: overrides.contentBackendRegion ?? process.env.CONTENT_BACKEND_REGION ?? "cn",
+    adminToken: overrides.adminToken ?? process.env.CONTENT_BACKEND_ADMIN_TOKEN ?? "dev-admin",
+    operatorToken: overrides.operatorToken ?? process.env.CONTENT_BACKEND_OPERATOR_TOKEN ?? "dev-op",
+    opsPort: overrides.opsPort ?? Number(process.env.OPS_PORT ?? 3002),
   };
 }

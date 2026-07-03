@@ -64,4 +64,26 @@ export const lyrics = pgTable(
   }),
 );
 
-export const schema = { ingest, review, tracks, lyrics };
+// content_policy：ops-platform 下发的策略（sim 闭环，M2b 消费侧）
+// unique index：command_id 幂等防重 + (rule_id, version) 防并发同 version（fold codex P1#3 竞态）
+export const contentPolicy = pgTable(
+  "content_policy",
+  {
+    id: text("id").primaryKey(),
+    ruleId: text("rule_id").notNull(),
+    action: text("action", { enum: ["allow", "block", "region_restrict"] }).notNull(),
+    targetScope: text("target_scope").notNull(),
+    version: integer("version").notNull(),
+    envelope: text("envelope").notNull(), // JSONB，存 PolicyEnvelope JSON
+    callerIdentity: text("caller_identity").notNull(),
+    commandId: text("command_id").notNull(),
+    receivedAt: timestamp("received_at", { withTimezone: true }).defaultNow().notNull(),
+    supersededBy: integer("superseded_by"),
+  },
+  (t) => ({
+    cmdUk: uniqueIndex("content_policy_cmd_uk").on(t.commandId),
+    ruleVerUk: uniqueIndex("content_policy_rule_ver_uk").on(t.ruleId, t.version),
+  }),
+);
+
+export const schema = { ingest, review, tracks, lyrics, contentPolicy };
