@@ -280,6 +280,8 @@ admin ──▶ /admin/ingest/:id/approve
 | Task | 范围 | 测试 |
 |---|---|---|
 | T1 | content_policy 表 migration + users(env) + policy-store.ts | unit：applyPolicy 幂等 + version 排序 + stale 覆盖 + latestPolicy |
+
+> **编号说明（fold ceo I1）**：本节 T1-T8 是 spec 视角的测试矩阵分组；plan task 编号见 plan File Structure（plan T4=http-mapping / T5=push / T6=kind-drm / T7=UI / T8=sim-闭环），与本表 T4-T7 顺序互换——编号非一一对应，plan Self-Review §1 已映射覆盖。
 | T2 | drm-rule-engine.ts + region-config.ts | unit：block 全 kind / allow / region_restrict 命中+不命中 / per-kind（stream vs query） |
 | T3 | audit-sink.ts（JSONL+hash chain）+ audit-events.ts（五 helper） | unit：append + hash chain 连续性 / 断链检测 / 五事件字段 |
 | T4 | App2 content_policy push endpoint + mTLS preHandler + audience 校验 | integration：mTLS mock cert push 200 / audience mismatch 403 / expiry 403 / command_id 重复幂等 / 旧 version superseded |
@@ -322,8 +324,9 @@ admin ──▶ /admin/ingest/:id/approve
 - 不做 pull fallback（defer M3，pull interface placeholder）。
 - 不做 third_party_api adapter（M2d）/ cloud-ext proxy（M2c）/ 端侧 adapter（M2c）。
 - 不扩 ops-config drm_rule region（D10 backend 自持）/ 不扩 M3-pre audit enum（D11 复用既有）。
-- 不做真机 mTLS（sim CA cert，真机硬件根签 cert 归 M5）。
+- 不做真机 mTLS（sim CA cert，真机硬件根签 cert 归 M5）。**sim 阶段仍做非 CN-only 校验**（CA trust + SAN + EKU clientAuth + validity，selfsigned 可设；fold codex P1/ceo C1/eng I3）：信任边界是强制跨厂商子集命中点，sim 就该校验逻辑有测试覆盖（wrong-CA/expired/wrong-SAN 拒绝），真机只加 CRL/OCSP revocation + 换硬件根签 cert。
 - 不做 audit 外部 sink（sim JSONL，真机外部 sink 归 M3）。
+- **M2b 只解锁 M3 链路 5 治理闭环**（content_policy 通道），链路 3（端侧 adapter）/链路 4（cloud-ext proxy）defer M2c/d（fold ceo I3，避免路线高估 M3 unblock 程度）。
 
 ## 10. 与 M2 contract / M3-pre 关系
 
