@@ -6,10 +6,25 @@
 
 import type { ContentDb } from "../content/db.js";
 import type { CapabilityMode, ErrorCode } from "../envelope.js";
+import type { DrmCtx } from "../policy/drm-ctx.js";
+import { emitToolCall } from "../audit/audit-events.js";
 import { getLyrics } from "../content/lyrics.js";
 
-export async function lyricsBusiness(db: ContentDb, trackId: string) {
+export async function lyricsBusiness(
+  db: ContentDb,
+  trackId: string,
+  ctx?: DrmCtx,
+) {
   const r = await getLyrics(db, trackId);
+  // ok 路径 emit tool_call audit（fold codex P2：drm 由 index.ts handle() 中央 guard，
+  // business 不内联 drm 块；lyrics 独立版权 blocked 不在此 emit——由 selectPath/getLyrics 决定）
+  if (ctx?.auditSink && r.outcome === "ok") {
+    await emitToolCall(ctx.auditSink, {
+      kind: "content_lyrics",
+      target: trackId,
+      actor: ctx.actor,
+    });
+  }
   return {
     outcome: r.outcome,
     backendType: "self_hosted" as const,

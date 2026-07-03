@@ -4,8 +4,8 @@
 // BLOCKED + BACKEND_UNAVAILABLE/AUTH_FAILED/无 errorCode → 503（server-side unavailable，5xx 兜底）。
 //
 // 注：errorCode 取值对齐 content-contract.schema.json:13 ErrorCode enum（schema 既有，
-// 含 AUTH_FAILED/REGION_RESTRICTED）。envelope.ts 既有 TS type 缺这两个（M2a 遗留），
-// T6 Step 1 扩 TS type 对齐 schema 后可去 as any；本签名用 string 兼容，不改 schema 不改 enum。
+// 含 AUTH_FAILED/REGION_RESTRICTED）。envelope.ts TS ErrorCode 已在 T6 Step 1 扩对齐 schema；
+// 本签名用 string 兼容（http-mapping 不绑 envelope.ts 类型，只做字符串→状态码映射）。
 
 const CLIENT_BLOCK = new Set(["COPYRIGHT_RESTRICTED", "REGION_RESTRICTED"]);
 

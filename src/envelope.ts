@@ -24,7 +24,9 @@ export type CompletionState =
 export type ErrorCode =
   | "NO_RESULT"
   | "COPYRIGHT_RESTRICTED"
-  | "BACKEND_UNAVAILABLE";
+  | "REGION_RESTRICTED"
+  | "BACKEND_UNAVAILABLE"
+  | "AUTH_FAILED";
 
 export interface Envelope {
   kind: Kind;

@@ -15,6 +15,8 @@ import { parseTrackId } from "../content/track-id.js";
 import { selectPath } from "../content/path-select.js";
 import { objectKey } from "../storage/presign.js";
 import type { CapabilityMode, ErrorCode } from "../envelope.js";
+import type { DrmCtx } from "../policy/drm-ctx.js";
+import { emitToolCall } from "../audit/audit-events.js";
 
 export interface PresignFn {
   (key: string): Promise<{
@@ -67,6 +69,7 @@ export async function streamBusiness(
   db: ContentDb,
   presign: PresignFn,
   trackId: string,
+  ctx?: DrmCtx,
 ): Promise<StreamOutcome> {
   const { provider, id } = parseTrackId(trackId);
   const path = selectPath(provider, false, "stream", false);
@@ -95,7 +98,7 @@ export async function streamBusiness(
   }
   const key = objectKey(provider, id, 1);
   const { url, auth } = await presign(key);
-  return {
+  const result: StreamOk = {
     outcome: "ok",
     backendType: path.backendType,
     capabilityMode: path.capabilityMode,
@@ -110,4 +113,15 @@ export async function streamBusiness(
       expires_at: auth.expires_at,
     },
   };
+  // ok 路径 emit tool_call audit（fold codex P2：drm 由 index.ts handle() 中央 guard，
+  // business 不内联 drm 块；仅 ok 路径 emit，auditSink 可选）
+  if (ctx?.auditSink) {
+    await emitToolCall(ctx.auditSink, {
+      kind: "content_stream",
+      target: trackId,
+      actor: ctx.actor,
+      streamId: result.business.stream_id,
+    });
+  }
+  return result;
 }

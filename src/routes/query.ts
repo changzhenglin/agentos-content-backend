@@ -8,6 +8,8 @@
 
 import type { ContentDb } from "../content/db.js";
 import type { CapabilityMode, ErrorCode } from "../envelope.js";
+import type { DrmCtx } from "../policy/drm-ctx.js";
+import { emitToolCall } from "../audit/audit-events.js";
 import { queryTracks } from "../content/self-hosted.js";
 
 /** query 请求形状（schema $defs/query：keywords 必需，intent/fuzzy 可选）。 */
@@ -17,11 +19,24 @@ export interface QueryRequest {
   fuzzy?: boolean;
 }
 
-export async function queryBusiness(db: ContentDb, query: QueryRequest) {
+export async function queryBusiness(
+  db: ContentDb,
+  query: QueryRequest,
+  ctx?: DrmCtx,
+) {
   const result = await queryTracks(db, query.keywords);
+  const outcome = result.candidates.length ? ("ok" as const) : ("no_result" as const);
   // business 回显 query（content-contract schema content_query 要求 envelope 含 query）
+  // ok 路径 emit tool_call audit（fold codex P2：drm 由 index.ts handle() 中央 guard）
+  if (ctx?.auditSink && outcome === "ok") {
+    await emitToolCall(ctx.auditSink, {
+      kind: "content_query",
+      target: query.keywords.join(" "),
+      actor: ctx.actor,
+    });
+  }
   return {
-    outcome: result.candidates.length ? ("ok" as const) : ("no_result" as const),
+    outcome,
     backendType: "self_hosted" as const,
     capabilityMode: "real" as CapabilityMode,
     errorCode: undefined as ErrorCode | undefined,

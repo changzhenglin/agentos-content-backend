@@ -31,6 +31,12 @@ import { presignUrl } from "./storage/presign.js";
 import { readFileSync } from "node:fs";
 import type { ContentDb } from "./content/db.js";
 import type { Kind, BackendType, CapabilityMode, Outcome, ErrorCode } from "./envelope.js";
+import type { PolicyStore } from "./policy/policy-store.js";
+import { createPolicyStore } from "./policy/policy-store.js";
+import type { AuditSink } from "./audit/audit-sink.js";
+import type { DrmCtx } from "./policy/drm-ctx.js";
+import { drmGuard } from "./policy/drm-guard.js";
+import { getRegion } from "./policy/region-config.js";
 
 // ajv compile content-contract schema + 预加载外部 $ref（track / runtime-mode）。
 // $ref 指向 https://agentos.dev/schemas/*.schema.json，按 $id 注册（解 I3：完整实现非注释）。
@@ -57,6 +63,12 @@ export interface BuildServerOpts {
   bucket?: string;
   /** PresignFn 注入（hexagonal）。默认 (key) => presignUrl(s3, bucket, key)。 */
   presign?: PresignFn;
+  /** PolicyStore 注入。默认 createPolicyStore(db)——drm fail-closed 独立于 audit（fold codex P1#6）。 */
+  policyStore?: PolicyStore;
+  /** AuditSink 注入（可选）。无 audit 时 drm 仍生效，仅无 audit emit。 */
+  auditSink?: AuditSink;
+  /** 调用方 actor 标识，用于 audit。默认 "anonymous-service"。 */
+  actor?: string;
 }
 
 const env = loadEnv();
@@ -90,14 +102,46 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
   const presign: PresignFn =
     opts.presign ?? ((key: string) => presignUrl(s3, bucket, key));
 
+  // fold codex P1#6：policyStore 默认始终注入（不依赖 auditSink）——drm fail-closed 独立于 audit。
+  // 既有 e2e 未传 policyStore 时用默认 store（空集 policy→allow），行为不回归；
+  // drm 默认生效（空集 allow），生产路径注入 auditSink 即有 audit emit。
+  const policyStore: PolicyStore = opts.policyStore ?? createPolicyStore(db);
+  const auditSink: AuditSink | undefined = opts.auditSink;
+  const actor = opts.actor ?? "anonymous-service";
+  const ctx: DrmCtx = { policyStore, auditSink, actor };
+
   const app = Fastify();
 
-  // 路由层统一 handle：调 handler → wrapEnvelope（透传 capabilityMode + errorCode）→ httpStatus。
-  // brief handle() 用 outcome 推算 capMode 有误（会覆盖 selectPath）；此处直接透传 handler 值。
+  // 路由层统一 handle：调 drmGuard 前置 → blocked 直接返 BLOCKED envelope 不调 business fn
+  // （fold codex P2：中央 guard，5 business functions 不内联 drm 块）→
+  // 调 handler → wrapEnvelope（透传 capabilityMode + errorCode）→ httpStatus。
+  // trackId：stream/lyrics/metadata 传真实 track_id；query/match 无 track_id 字段，
+  // 传占位 ""（T2 checkDrm 是 sim 全 kind 全 track 命中，block policy 仍命中；空集 allow）。
+  // requestRegion：从请求头 X-Region 提取（默认 getRegion()=backendRegion）——
+  // 解 T8-blocker：ctx.requestRegion 从未注入→requestRegion==backendRegion→
+  // region_restrict 永不命中。改由 route handler 提取 X-Region 传 handle→drmGuard，
+  // T8 sim 闭环可发 X-Region: us（backend=cn）触发 region_restrict block。
   async function handle(
     kind: Kind,
     fn: () => Promise<HandlerResult>,
+    trackId: string,
+    requestRegion: string,
   ): Promise<{ envelope: object; status: number }> {
+    const guard = await drmGuard(ctx, kind, trackId, requestRegion);
+    if (guard.blocked) {
+      const envelope = wrapEnvelope(
+        {},
+        kind,
+        "self_hosted",
+        "unavailable",
+        "blocked",
+        guard.errorCode,
+      );
+      return {
+        envelope,
+        status: httpStatus(envelope.completion_state, envelope.error_code),
+      };
+    }
     const r = await fn();
     const envelope = wrapEnvelope(
       r.business,
@@ -111,32 +155,55 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
   }
 
   app.post("/content_query", async (req, reply) => {
-    const { envelope, status } = await handle("content_query", () =>
-      queryBusiness(db, (req.body as any).query),
+    const requestRegion = (req.headers["x-region"] as string) || getRegion();
+    const { envelope, status } = await handle(
+      "content_query",
+      () => queryBusiness(db, (req.body as any).query, ctx),
+      "", // query 无 track_id，占位 ""（block policy 全 kind 全 track 命中；空集 allow）
+      requestRegion,
     );
     reply.code(status).send(envelope);
   });
   app.post("/content_match", async (req, reply) => {
-    const { envelope, status } = await handle("content_match", () =>
-      matchBusiness(db, (req.body as any).match),
+    const requestRegion = (req.headers["x-region"] as string) || getRegion();
+    const { envelope, status } = await handle(
+      "content_match",
+      () => matchBusiness(db, (req.body as any).match, ctx),
+      "", // match 无 track_id，占位 ""
+      requestRegion,
     );
     reply.code(status).send(envelope);
   });
   app.post("/content_stream", async (req, reply) => {
-    const { envelope, status } = await handle("content_stream", () =>
-      streamBusiness(db, presign, (req.body as any).track_id),
+    const tid = (req.body as any).track_id;
+    const requestRegion = (req.headers["x-region"] as string) || getRegion();
+    const { envelope, status } = await handle(
+      "content_stream",
+      () => streamBusiness(db, presign, tid, ctx),
+      tid,
+      requestRegion,
     );
     reply.code(status).send(envelope);
   });
   app.post("/content_lyrics", async (req, reply) => {
-    const { envelope, status } = await handle("content_lyrics", () =>
-      lyricsBusiness(db, (req.body as any).track_id),
+    const tid = (req.body as any).track_id;
+    const requestRegion = (req.headers["x-region"] as string) || getRegion();
+    const { envelope, status } = await handle(
+      "content_lyrics",
+      () => lyricsBusiness(db, tid, ctx),
+      tid,
+      requestRegion,
     );
     reply.code(status).send(envelope);
   });
   app.post("/content_metadata", async (req, reply) => {
-    const { envelope, status } = await handle("content_metadata", () =>
-      metadataBusiness(db, (req.body as any).track_id),
+    const tid = (req.body as any).track_id;
+    const requestRegion = (req.headers["x-region"] as string) || getRegion();
+    const { envelope, status } = await handle(
+      "content_metadata",
+      () => metadataBusiness(db, tid, ctx),
+      tid,
+      requestRegion,
     );
     reply.code(status).send(envelope);
   });
