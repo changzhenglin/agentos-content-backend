@@ -77,7 +77,7 @@ describe("stream e2e", () => {
     expect(env.url).toBe("https://mock.s3/self:t1:v1");
   });
 
-  it("envelope wrap（blocked → BLOCKED → 503，errorCode 透传 COPYRIGHT_RESTRICTED）", async () => {
+  it("envelope wrap（blocked → BLOCKED，errorCode 透传 COPYRIGHT_RESTRICTED → I1 收窄 403）", async () => {
     const db = createTestDb();
     const r = await streamBusiness(db, mockPresign, "qq:song1");
     // handler 透传 capabilityMode + errorCode（selectPath unavailable + COPYRIGHT_RESTRICTED）
@@ -91,6 +91,7 @@ describe("stream e2e", () => {
     );
     expect(env.completion_state).toBe("BLOCKED");
     expect(env.error_code).toBe("COPYRIGHT_RESTRICTED");
-    expect(httpStatus(env.completion_state)).toBe(503);
+    // I1 收窄：BLOCKED + COPYRIGHT_RESTRICTED → 403（client-side block）
+    expect(httpStatus(env.completion_state, env.error_code)).toBe(403);
   });
 });

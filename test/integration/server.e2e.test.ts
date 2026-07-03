@@ -125,7 +125,7 @@ describe("server e2e", () => {
     expect(validate(body)).toBe(true);
   });
 
-  it("POST /content_stream blocked (third_party 未授权) → 503 BLOCKED", async () => {
+  it("POST /content_stream blocked (third_party 未授权) → 403 BLOCKED（I1 收窄：client-side copyright block）", async () => {
     const db = createTestDb();
     const app = await buildServer({ db, presign: mockPresign });
     const r = await app.inject({
@@ -133,7 +133,7 @@ describe("server e2e", () => {
       url: "/content_stream",
       payload: { track_id: "qq:song1" },
     });
-    expect(r.statusCode).toBe(503);
+    expect(r.statusCode).toBe(403);
     const body = r.json();
     expect(body.completion_state).toBe("BLOCKED");
     expect(body.error_code).toBe("COPYRIGHT_RESTRICTED");

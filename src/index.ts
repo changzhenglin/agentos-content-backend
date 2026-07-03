@@ -107,7 +107,7 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
       r.outcome,
       r.errorCode,
     );
-    return { envelope, status: httpStatus(envelope.completion_state) };
+    return { envelope, status: httpStatus(envelope.completion_state, envelope.error_code) };
   }
 
   app.post("/content_query", async (req, reply) => {
