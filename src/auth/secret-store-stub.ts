@@ -74,12 +74,18 @@ export function createStubSecretStore(
       if (!allowed.includes(source)) {
         return { ok: false, error: "source_not_allowed" };
       }
-      // 3) provider binding 校验（codex P2.6）：传 expectedProvider 时必须与 handle 内 provider 段一致
+      // 3) provider binding 校验（codex P2.6）：传 expectedProvider 时，仅当 handle 内有结构 provider 段
+      //    （3 段 colon handle，如 ^backend:qq:token_v1）才做一致校验；
+      //    2 段 opaque handle（option A 生产格式 ^backend:qq-token_v1，fit ops-config.schema.json
+      //    pattern ^backend:[a-zA-Z0-9_-]+$，无冒号 → providerSegment 返 undefined）→ skip binding 校验，
+      //    provider 绑定靠 rule lookup（rule_id=provider→token_ref），非 resolveHandle 结构校验。
+      //    防 providerHandle[provider] 指向错误 provider 的 3 段 handle 致跨 provider 凭证泄漏。
       if (expectedProvider !== undefined) {
         const hp = providerSegment(handle);
-        if (hp !== expectedProvider) {
+        if (hp !== undefined && hp !== expectedProvider) {
           return { ok: false, error: "provider_binding_mismatch" };
         }
+        // hp === undefined：2 段 opaque handle（option A 生产格式），无结构 provider 段，binding skip
       }
       // 4) handle 存在性
       const s = secrets[handle];

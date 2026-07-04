@@ -167,16 +167,16 @@ describe("route-authorize e2e (Task 6)", () => {
     const db = createTestDb();
     const policyStore = createPolicyStore(db);
     // push content_policy：rule_id=qq（option A：rule_id 即 provider 名），action=allow，
-    // auth_config.token_ref=^backend:qq:token_v1（colon 格式，对齐 Task 1/5 secret-store-stub
-    // providerSegment 按 `:` split 取 index 1 的实现；brief 的 hyphen `^backend:qq-token_v1`
-    // 与 Task 1/5 实现不一致——见 report concerns）
+    // auth_config.token_ref=^backend:qq-token_v1（hyphen 格式，对齐 option A 生产 handle +
+    // ops-config.schema.json pattern ^backend:[a-zA-Z0-9_-]+$，无冒号 → secret-store-stub
+    // providerSegment 返 undefined → binding 校验 skip，provider 绑定靠 rule_id=qq lookup）
     await policyStore.applyPolicy(
-      mkPolicyEnvelope("qq", "allow", "^backend:qq:token_v1"),
+      mkPolicyEnvelope("qq", "allow", "^backend:qq-token_v1"),
       "ops-platform",
     );
 
     const secretStore = createStubSecretStore({
-      "^backend:qq:token_v1": { token: "mock-qq-token", token_type: "bearer" },
+      "^backend:qq-token_v1": { token: "mock-qq-token", token_type: "bearer" },
     });
     const auditSink = createAuditSink(auditPath);
     const app = await buildServer({
