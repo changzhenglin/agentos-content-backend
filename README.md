@@ -71,3 +71,74 @@ DATABASE_URL=postgres://... pnpm tsx scripts/seed.ts
 | 审核 UI | defer | M2b |
 | audit（stream_id / §8.3） | defer | M2b / M3-pre |
 | secret_handle transport-only | defer | Global Constraints |
+
+## M2b 审核 UI + content_policy 消费通道
+
+M2b 落地 ops-facing 审核 App（App2，mTLS sim CA）+ content_policy 消费通道（block/allow/region_restrict）+ 中央 drm-guard + audit hash chain + 审核 UI（htmx SSR）。
+
+### 启动双 app
+
+App1（5 kind API，port 3001）：
+
+```bash
+tsx src/index.ts
+```
+
+App2（ops-facing，port 3002，mTLS sim CA + 审核 UI）：
+
+```bash
+tsx src/ops-app.ts
+```
+
+env：
+
+| 变量 | 说明 | 默认 |
+|---|---|---|
+| `DATABASE_URL` | Postgres 连接串 | `postgres://localhost:5432/agentos_content` |
+| `AUDIT_SINK_PATH` | audit JSONL 路径 | `.audit.jsonl` |
+| `CONTENT_BACKEND_REGION` | backend 自持 region（drm region_restrict 判定） | `cn` |
+| `CONTENT_BACKEND_ADMIN_TOKEN` | admin token（审核 UI 登录） | — |
+| `CONTENT_BACKEND_OPERATOR_TOKEN` | operator token（只读审核队列） | — |
+| `OPS_PORT` | App2 listen 端口 | `3002` |
+
+### sim 闭环演示
+
+```bash
+# 1. 启 App2（生成 sim CA cert + listen 3002）
+OPS_PORT=3002 tsx src/ops-app.ts
+
+# 2. mock producer push block policy（首次自动生成 .sim-certs/ 并缓存）
+tsx scripts/mock-policy-producer.ts 3002 block sim-block 1
+
+# 3. 启 App1，调 /content_stream → 403 COPYRIGHT_RESTRICTED
+tsx src/index.ts  # 另一终端
+curl -X POST localhost:3001/content_stream -d '{"track_id":"self:t1"}'
+
+# 切换 allow（version 递增覆盖 block）
+tsx scripts/mock-policy-producer.ts 3002 allow sim-allow 2
+curl -X POST localhost:3001/content_stream -d '{"track_id":"self:t1"}'  # → 200
+
+# region_restrict：发 X-Region: us（backend=cn，不符→403 REGION_RESTRICTED）
+tsx scripts/mock-policy-producer.ts 3002 region_restrict sim-region 3
+curl -X POST localhost:3001/content_stream -H 'x-region: us' -d '{"track_id":"self:t1"}'  # → 403
+```
+
+`mock-policy-producer.ts` CLI：`tsx scripts/mock-policy-producer.ts <port> <allow|block|region_restrict> <commandId> [version]`。cert 缓存于 `.sim-certs/`（首次生成 sim CA + service cert，后续复用，dev 反复跑不重复生成）。push envelope 含 upstream version（stale 拒绝 + 幂等由 policy-store 保证）。
+
+### 审核 UI
+
+浏览器开 `https://localhost:3002/admin/login`（sim CA self-signed，需手动信任），dev token = `CONTENT_BACKEND_ADMIN_TOKEN`。
+
+- `/admin/login`：token 登录（admin/operator 双角色）
+- `/admin/ingests`：待审核 ingest 队列（pending）
+- `/admin/ingest/:id`：ingest 详情 + approve/reject/revoke（htmx partial swap）
+- `/admin/ingest`（POST）：admin 入库新 ingest
+- `/admin/tracks`：曲库列表
+
+### 验收
+
+```bash
+pnpm test  # 120/120 PASS（含 sim 闭环 e2e 4 用例：block/allow/region_restrict + audit 链）
+```
+
+sim 闭环 e2e 覆盖全链：producer push → App2 接收（mTLS + audience/expiry/actor 校验）→ App1 kind 受 drm-guard 约束（block→403 / allow→200 / region_restrict+X-Region→403）→ audit hash chain（config_apply + tool_call，verifyChain 完整）。
