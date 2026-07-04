@@ -45,6 +45,9 @@ importers:
       '@testcontainers/minio':
         specifier: ^12
         version: 12.0.4
+      '@testcontainers/postgresql':
+        specifier: ^12.0.4
+        version: 12.0.4
       '@types/node':
         specifier: ^22
         version: 22.20.0
@@ -1042,6 +1045,9 @@ packages:
 
   '@testcontainers/minio@12.0.4':
     resolution: {integrity: sha512-RTSans479Cif8gFNSC7xudKBVBgHYd/5HI9r98STZtc3bdnrhDhlLA2F81NKvw57xp0gu7OCaMtNrYTRNSLLuw==}
+
+  '@testcontainers/postgresql@12.0.4':
+    resolution: {integrity: sha512-a/pLU6j5lpKKAlUTPwqweqMGhOSjgTSb6HBX69TOrXn32ifU37nnQDmNFTj8ddOAw+BQL9oTRkeOxVbZkqhgZA==}
 
   '@types/docker-modem@3.0.6':
     resolution: {integrity: sha512-yKpAGEuKRSS8wwx0joknWxsmLha78wNMe9R2S3UNsVOkZded8UqOrV8KoeDXoXsjndxwyF3eIhyClGbO1SEhEg==}
@@ -3242,6 +3248,15 @@ snapshots:
       tslib: 2.8.1
 
   '@testcontainers/minio@12.0.4':
+    dependencies:
+      testcontainers: 12.0.4
+    transitivePeerDependencies:
+      - bare-abort-controller
+      - bare-buffer
+      - react-native-b4a
+      - supports-color
+
+  '@testcontainers/postgresql@12.0.4':
     dependencies:
       testcontainers: 12.0.4
     transitivePeerDependencies:

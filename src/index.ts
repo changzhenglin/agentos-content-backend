@@ -83,6 +83,20 @@ export interface BuildServerOpts {
 
 const env = loadEnv();
 
+/**
+ * M2d: 从 STUB_SECRETS_PATH fixture JSON 加载 stub secrets（spawn env 传，D9 e2e 用）。
+ * JSON 形如 { "^backend:qq-token_v1": { "token": "...", "token_type": "bearer" } }。
+ * 加载失败（文件不存在/JSON 解析错）→ 空对象（安全 fail，third_party resolve 会 handle_not_found）。
+ */
+function loadStubSecrets(path: string): Record<string, { token: string; token_type: "bearer" | "query_param"; expiry?: string; audience?: string }> {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch (e) {
+    console.warn(`[index] failed to load stub secrets from ${path}:`, e);
+    return {};
+  }
+}
+
 interface HandlerResult {
   outcome: Outcome;
   backendType: BackendType;
@@ -123,8 +137,16 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
   const actor = opts.actor ?? "anonymous-service";
   // M2d: secretStore 默认空 stub（third_party resolve 在无 secret 时返 handle_not_found→AUTH_FAILED，
   // 生产注入真 store；真 store runtime defer M3-pre SDD）。
-  const secretStore: SecretStore = opts.secretStore ?? createStubSecretStore({});
-  const providerBaseUrl: Record<string, string> = opts.providerBaseUrl ?? {};
+  // CLI/spawn 路径：env.stubSecretsPath 非空时 load fixture JSON 构 stub store（D9 e2e 用，
+  // P1.3 方案 A——spawn env 传 STUB_SECRETS_PATH，backend 启动 load 构 stub store）。
+  // 既有 in-process e2e 未传 secretStore 且 env.stubSecretsPath 空（vitest 不设该 env）→ 默认空 stub，不回归。
+  const secretStore: SecretStore =
+    opts.secretStore ??
+    (env.stubSecretsPath
+      ? createStubSecretStore(loadStubSecrets(env.stubSecretsPath))
+      : createStubSecretStore({}));
+  // M2d: providerBaseUrl 默认从 env（PROVIDER_BASE_URL_<PROVIDER> 解析）；opts 优先（in-process e2e 用）。
+  const providerBaseUrl: Record<string, string> = opts.providerBaseUrl ?? env.providerBaseUrl;
   const ctx: DrmCtx = { policyStore, auditSink, actor };
 
   const app = Fastify();
@@ -407,7 +429,8 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
 }
 
 // CLI 入口：node --import tsx src/index.ts 或 tsx src/index.ts。
+// M2d: listen 端口从 env.port 读（PORT env，default 3001；D9 e2e spawn 传动态端口避免冲突）。
 if (import.meta.url === new URL(`file://${process.argv[1]}`).href) {
   const app = await buildServer();
-  app.listen({ port: 3001 });
+  app.listen({ port: env.port, host: "0.0.0.0" });
 }
