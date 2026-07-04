@@ -52,7 +52,7 @@ async function fetchIngestTrackId(
 
 export async function ingestTransitionAndAudit(
   db: ContentDb,
-  auditSink: AuditSink,
+  auditSink: AuditSink | undefined, // I2 fix: pass-through undefined（emit 函数已 guard）
   ingestId: string,
   action: "approve" | "reject" | "revoke",
   actor: string,

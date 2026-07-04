@@ -6,6 +6,7 @@ import {
   emitRevoke,
   emitConfigApply,
   emitToolCall,
+  emitUnauthorized,
 } from "../../src/audit/audit-events.js";
 
 describe("audit-sink", () => {
@@ -91,5 +92,15 @@ describe("audit-sink", () => {
     const lines = readFileSync(path, "utf8").trim().split("\n");
     expect(JSON.parse(lines[0]).actorType).toBe("human");
     expect(JSON.parse(lines[1]).actorType).toBe("service");
+  });
+
+  // I2 fix: CLI 默认不 wire auditSink（env.auditSinkPath 默认空串）→ emit 函数须容忍 undefined sink，
+  // no-throw no-op（不崩 403/业务路径）。secret-handle-hook.emitSecretHandleAudit 已有同款 guard。
+  it("emit 函数 sink=undefined → no-throw no-op（I2: CLI 默认无 auditSink 时 audit 静默）", async () => {
+    await expect(emitProvision(undefined as any, { ingestId: "i1", trackId: "self:t1", actor: "admin" })).resolves.toBeUndefined();
+    await expect(emitRevoke(undefined as any, { trackId: "self:t1", actor: "admin" })).resolves.toBeUndefined();
+    await expect(emitConfigApply(undefined as any, { ruleId: "r1", version: 1, actor: "ops-platform" })).resolves.toBeUndefined();
+    await expect(emitToolCall(undefined as any, { kind: "content_stream", target: "self:t1", actor: "cloud-ext", streamId: 99 })).resolves.toBeUndefined();
+    await expect(emitUnauthorized(undefined as any, { caller: "ops-platform", reason: "audience_mismatch", target: "content_policy" })).resolves.toBeUndefined();
   });
 });

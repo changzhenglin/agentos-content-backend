@@ -37,7 +37,7 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
         process.env.S3_SECRET_ACCESS_KEY ??
         "minioadmin",
     },
-    auditSinkPath: overrides.auditSinkPath ?? process.env.AUDIT_SINK_PATH ?? ".audit.jsonl",
+    auditSinkPath: overrides.auditSinkPath ?? process.env.AUDIT_SINK_PATH ?? "",
     contentBackendRegion: overrides.contentBackendRegion ?? process.env.CONTENT_BACKEND_REGION ?? "cn",
     adminToken: overrides.adminToken ?? process.env.CONTENT_BACKEND_ADMIN_TOKEN ?? "dev-admin",
     operatorToken: overrides.operatorToken ?? process.env.CONTENT_BACKEND_OPERATOR_TOKEN ?? "dev-op",

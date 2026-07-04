@@ -44,7 +44,7 @@ export interface TlsOpts {
 
 export interface BuildOpsAppOpts {
   db: ContentDb;
-  auditSink: AuditSink;
+  auditSink?: AuditSink; // I2 fix: 可选——CLI 默认 env.auditSinkPath 空串不 wire sink
   tlsOpts?: TlsOpts;
   policyStore?: PolicyStore;
   expectedSan?: string; // 期望 peer cert SAN（D1 非 CN-only）
@@ -398,9 +398,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   };
   const app = await buildOpsApp({
     db,
-    auditSink: (await import("./audit/audit-sink.js")).createAuditSink(
-      env.auditSinkPath,
-    ),
+    auditSink: env.auditSinkPath
+      ? (await import("./audit/audit-sink.js")).createAuditSink(env.auditSinkPath)
+      : undefined,
     tlsOpts: {
       key: svc.private,
       cert: svc.cert,
