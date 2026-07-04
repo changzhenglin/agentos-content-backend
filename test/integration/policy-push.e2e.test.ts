@@ -169,8 +169,9 @@ function envelope(
   expiryMs = 60000,
   upstreamVersion = 1,
   actor = "ops-platform",
+  authConfig?: { token_source: string; token_ref: string },
 ) {
-  return {
+  const env: any = {
     command_id: cmdId,
     kind: "content_policy",
     capability_mode: "real",
@@ -183,6 +184,8 @@ function envelope(
       expiry: new Date(Date.now() + expiryMs).toISOString(),
     },
   };
+  if (authConfig) env.payload.auth_config = authConfig;
+  return env;
 }
 
 describe("content_policy push e2e", () => {
@@ -283,6 +286,41 @@ describe("content_policy push e2e", () => {
     const bad = envelope("content_backend", "cmd-nosc");
     delete (bad as any).security_context;
     const r = await postPush(bad);
+    expect(r.status).toBe(400);
+    expect(r.body.error_code).toBe("INVALID_ENVELOPE");
+  });
+
+  // M2d codex P2.1 fix：auth_config.token_ref pattern ingress 校验。
+  it("auth_config.token_ref 缺 caret（backend:foo）→ 400 INVALID_ENVELOPE（不 persist 坏值，P2.1）", async () => {
+    const r = await postPush(
+      envelope("content_backend", "cmd-badref", "allow", 60000, 1, "ops-platform", {
+        token_source: "backend_issued",
+        token_ref: "backend:foo", // 缺 caret，schema pattern 不符
+      }),
+    );
+    expect(r.status).toBe(400);
+    expect(r.body.error_code).toBe("INVALID_ENVELOPE");
+  });
+
+  it("auth_config.token_ref 带 caret（^backend:qq-token_v1）→ 200 applied（合规 persist，P2.1）", async () => {
+    // 用独立 rule_id + 高 version 避免与 cmd-1（rule_id=r1, v1）stale 冲突致 applied=false。
+    const env = envelope("content_backend", "cmd-goodref", "allow", 60000, 100, "ops-platform", {
+      token_source: "backend_issued",
+      token_ref: "^backend:qq-token_v1",
+    });
+    (env as any).payload.rule_id = "r-auth-good";
+    const r = await postPush(env);
+    expect(r.status).toBe(200);
+    expect(r.body.applied).toBe(true);
+  });
+
+  it("auth_config.token_source 非法 → 400 INVALID_ENVELOPE（P2.1）", async () => {
+    const r = await postPush(
+      envelope("content_backend", "cmd-badsrc", "allow", 60000, 1, "ops-platform", {
+        token_source: "evil_source",
+        token_ref: "^backend:foo",
+      }),
+    );
     expect(r.status).toBe(400);
     expect(r.body.error_code).toBe("INVALID_ENVELOPE");
   });

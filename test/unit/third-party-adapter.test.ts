@@ -216,4 +216,42 @@ describe("third-party-adapter", () => {
     expect(r.outcome).toBe("blocked");
     expect(r.errorCode).toBe("AUTH_FAILED");
   });
+
+  // M2d codex P2.2 fix：providerBaseUrl 缺失/空 → blocked/BACKEND_UNAVAILABLE（不 throw 500）。
+  // 原先 new URL("") 在 try 外，TypeError 逃出 catch → 进程 unhandled → 非 BACKEND_UNAVAILABLE。
+  it("providerBaseUrl 缺失（空串）→ blocked/BACKEND_UNAVAILABLE（不 throw 500，P2.2）", async () => {
+    const store = createStubSecretStore({
+      "^backend:qq:token_v1": { token: "mock-qq-token", token_type: "bearer" },
+    });
+    const r = await fetchThirdParty({
+      kind: "content_query",
+      request: {},
+      providerHandle: "^backend:qq:token_v1",
+      provider: "qq",
+      store,
+      caller: "content-backend",
+      providerBaseUrl: "",
+    });
+    expect(r.outcome).toBe("blocked");
+    expect(r.capabilityMode).toBe("unavailable");
+    expect(r.errorCode).toBe("BACKEND_UNAVAILABLE");
+  });
+
+  // M2d codex P2.2 fix：providerBaseUrl 非法（非 URL）→ blocked/BACKEND_UNAVAILABLE（new URL throw 被 catch）。
+  it("providerBaseUrl 非法（非 URL）→ blocked/BACKEND_UNAVAILABLE（new URL throw 被映射，P2.2）", async () => {
+    const store = createStubSecretStore({
+      "^backend:qq:token_v1": { token: "mock-qq-token", token_type: "bearer" },
+    });
+    const r = await fetchThirdParty({
+      kind: "content_query",
+      request: {},
+      providerHandle: "^backend:qq:token_v1",
+      provider: "qq",
+      store,
+      caller: "content-backend",
+      providerBaseUrl: "not-a-valid-url",
+    });
+    expect(r.outcome).toBe("blocked");
+    expect(r.errorCode).toBe("BACKEND_UNAVAILABLE");
+  });
 });

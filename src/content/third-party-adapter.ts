@@ -82,10 +82,23 @@ export async function fetchThirdParty(
   }
   const { token, token_type } = result.secret;
 
+  // M2d codex P2.2 fix：providerBaseUrl 缺失/空 → 早 return BACKEND_UNAVAILABLE（对齐 P2.7 catch 分流精神）。
+  // 原先 new URL 在 try 外，空/无效 baseUrl 抛 TypeError 逃出 catch → 500 非 BACKEND_UNAVAILABLE。
+  // 此 guard 为第一道防线；下方 new URL 仍在 try 内（双保险，防 baseUrl 非空但非法 hostname）。
+  if (!providerBaseUrl) {
+    return blocked("BACKEND_UNAVAILABLE");
+  }
+
   // 构造请求 URL + 凭证注入（token_type 真用，P2.5）。
   const subPath = KIND_PATH[kind] ?? kind.replace("content_", "");
-  const url = new URL(`${providerBaseUrl}/${subPath}`);
   const headers: Record<string, string> = {};
+  // url 在 try 内构造（P2.2：invalid URL 抛 TypeError 须被 catch 映射 BACKEND_UNAVAILABLE）。
+  let url: URL;
+  try {
+    url = new URL(`${providerBaseUrl}/${subPath}`);
+  } catch {
+    return blocked("BACKEND_UNAVAILABLE");
+  }
   if (token_type === "bearer") {
     headers.authorization = `Bearer ${token}`;
   } else if (token_type === "query_param") {

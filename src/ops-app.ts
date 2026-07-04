@@ -131,6 +131,35 @@ export async function buildOpsApp(opts: BuildOpsAppOpts) {
         .code(400)
         .send(errBody("INVALID_ENVELOPE", "envelope shape invalid (security_context required)"));
     }
+    // M2d codex P2.1 fix：auth_config.token_ref pattern ingress 校验（reject malformed at ingress，不 persist 坏值）。
+    // 对齐 AgentOS ops-config.schema.json $defs.auth_config allOf：token_source=ops_managed → ^\^ops:[a-zA-Z0-9_-]+$；
+    // token_source=backend_issued → ^\^backend:[a-zA-Z0-9_-]+$。schema 在 AgentOS 仓（不引入 ajv 依赖复用），
+    // inline pattern 校验 + 注释对齐 schema（schema 是 single source of truth，schema 改时此 pattern 同步）。
+    const ac = env.payload?.auth_config;
+    if (ac) {
+      const validSources = ["ops_managed", "backend_issued"];
+      const refPat =
+        ac.token_source === "ops_managed"
+          ? /^\^ops:[a-zA-Z0-9_-]+$/
+          : ac.token_source === "backend_issued"
+            ? /^\^backend:[a-zA-Z0-9_-]+$/
+            : null;
+      if (
+        !validSources.includes(ac.token_source) ||
+        refPat === null ||
+        typeof ac.token_ref !== "string" ||
+        !refPat.test(ac.token_ref)
+      ) {
+        await emitUnauthorized(opts.auditSink, {
+          caller,
+          reason: "invalid_envelope",
+          target: "content_policy",
+        });
+        return reply
+          .code(400)
+          .send(errBody("INVALID_ENVELOPE", "auth_config.token_ref pattern invalid"));
+      }
+    }
     // audience 校验
     if (sc.audience !== "content_backend") {
       await emitUnauthorized(opts.auditSink, {

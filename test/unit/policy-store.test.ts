@@ -96,9 +96,10 @@ describe("policy-store", () => {
   });
 
   // M2d Task 3: auth_config（option A，单 string token_ref，对齐 ops-config.schema.json）
+  // M2d codex P2.1 fix：fixture 对齐 C1 fix 生产值 + fixed schema pattern（带 caret ^backend:...）。
   const authCfg: AuthConfig = {
     token_source: "backend_issued",
-    token_ref: "backend:qq-token_v1", // 单段 ^backend:<provider>-<id>，fit ^backend:[a-zA-Z0-9_-]+$
+    token_ref: "^backend:qq-token_v1", // 单段 ^backend:<provider>-<id>，fit ^\^backend:[a-zA-Z0-9_-]+$
   };
 
   it("applyPolicy 含 auth_config → latestPolicy 返 auth_config（option A 单 string）", async () => {
@@ -112,7 +113,7 @@ describe("policy-store", () => {
     expect(latest[0].envelope.payload).toHaveProperty("auth_config");
     expect(latest[0].envelope.payload.auth_config).toEqual(authCfg);
     expect(latest[0].envelope.payload.auth_config?.token_ref).toBe(
-      "backend:qq-token_v1",
+      "^backend:qq-token_v1",
     );
   });
 
