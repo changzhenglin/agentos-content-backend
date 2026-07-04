@@ -38,7 +38,11 @@ import { createAuditSink } from "./audit/audit-sink.js";
 import type { DrmCtx } from "./policy/drm-ctx.js";
 import { drmGuard } from "./policy/drm-guard.js";
 import { getRegion } from "./policy/region-config.js";
-import { emitSecretHandleAudit } from "./auth/secret-handle-hook.js";
+import { receiveAndAuthorize } from "./auth/secret-handle-hook.js";
+import { fetchThirdParty } from "./content/third-party-adapter.js";
+import { selectPath } from "./content/path-select.js";
+import { parseTrackId, type Provider } from "./content/track-id.js";
+import { createStubSecretStore, type SecretStore } from "./auth/secret-store-stub.js";
 
 // ajv compile content-contract schema + 预加载外部 $ref（track / runtime-mode）。
 // $ref 指向 https://agentos.dev/schemas/*.schema.json，按 $id 注册（解 I3：完整实现非注释）。
@@ -71,6 +75,10 @@ export interface BuildServerOpts {
   auditSink?: AuditSink;
   /** 调用方 actor 标识，用于 audit。默认 "anonymous-service"。 */
   actor?: string;
+  /** M2d: secret store（third_party resolve；默认 stub 空 map，真 store defer M3-pre SDD）。 */
+  secretStore?: SecretStore;
+  /** M2d: mock provider endpoint map（provider→base url；真 provider 授权后换真 endpoint）。 */
+  providerBaseUrl?: Record<string, string>;
 }
 
 const env = loadEnv();
@@ -113,6 +121,10 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
   const auditSink: AuditSink | undefined =
     opts.auditSink ?? (env.auditSinkPath ? createAuditSink(env.auditSinkPath) : undefined);
   const actor = opts.actor ?? "anonymous-service";
+  // M2d: secretStore 默认空 stub（third_party resolve 在无 secret 时返 handle_not_found→AUTH_FAILED，
+  // 生产注入真 store；真 store runtime defer M3-pre SDD）。
+  const secretStore: SecretStore = opts.secretStore ?? createStubSecretStore({});
+  const providerBaseUrl: Record<string, string> = opts.providerBaseUrl ?? {};
   const ctx: DrmCtx = { policyStore, auditSink, actor };
 
   const app = Fastify();
@@ -159,14 +171,93 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     return { envelope, status: httpStatus(envelope.completion_state, envelope.error_code) };
   }
 
+  /**
+   * M2d: fetchThirdParty 返 ThirdPartyResult（outcome="done"|"blocked"），
+   * handle() 期望 HandlerResult（Outcome="ok"|"no_result"|"blocked"|"unavailable"）。
+   * 映射："done"→"ok"；"blocked"→"blocked"；其余字段直传。
+   */
+  function toHandlerResult(r: {
+    outcome: "done" | "blocked";
+    backendType: "third_party_api";
+    capabilityMode: "real" | "unavailable";
+    errorCode?: string;
+    business: Record<string, unknown>;
+  }): HandlerResult {
+    return {
+      outcome: r.outcome === "done" ? "ok" : r.outcome,
+      backendType: r.backendType,
+      capabilityMode: r.capabilityMode,
+      errorCode: r.errorCode as ErrorCode | undefined,
+      business: r.business,
+    };
+  }
+
+  /**
+   * M2d: provider 路径解析（fold eng F4 参数源明确）。
+   * - provider：query/match 从 body.provider（默认 self）；stream/lyrics/metadata 从 track_id 解析
+   * - authorized：latestPolicy 中存在 rule_id===provider 且 action==="allow" 的 rule（option A：rule_id=provider 约定）
+   * - providerAvailable：process.env.PROVIDER_AVAILABLE !== "false"（sim 默认 true，真 health check defer 授权后）
+   * - providerHandle：从 authorized rule 的 envelope.payload.auth_config?.token_ref 取（单段 ^backend:...）
+   * 返回 selectPath 决策 + providerHandle（third_party 分支用）。
+   */
+  async function resolveProviderPath(
+    kind: Kind,
+    provider: Provider,
+  ): Promise<{
+    backendType: BackendType;
+    providerHandle: string;
+  }> {
+    // self provider 无需查 content_policy（selectPath 对 self 忽略 authorized/providerAvailable，
+    // 固定返 self_hosted/real）——短路避免 broken policyStore 致 500（drmGuard 内部 fail-closed 503）
+    if (provider === "self") {
+      return { backendType: "self_hosted", providerHandle: "" };
+    }
+    const latest = await policyStore.latestPolicy();
+    const allowRule = latest.find(
+      (p) => p.action === "allow" && p.ruleId === provider,
+    );
+    const authorized = !!allowRule;
+    const providerAvailable = process.env.PROVIDER_AVAILABLE !== "false";
+    const providerHandle =
+      (allowRule?.envelope.payload.auth_config?.token_ref as string | undefined) ??
+      "";
+    const capKind = kind.replace("content_", "") as
+      | "query"
+      | "match"
+      | "stream"
+      | "lyrics"
+      | "metadata";
+    const path = selectPath(provider, authorized, capKind, providerAvailable);
+    return { backendType: path.backendType, providerHandle };
+  }
+
   app.post("/content_query", async (req, reply) => {
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
+    const caller = (req.headers["x-caller-identity"] as string) || "anonymous";
     const traceId = (req.headers["x-trace-id"] as string) || undefined;
-    await emitSecretHandleAudit(auditSink, secretHandle, actor, traceId);
+    // M2d: receiveAndAuthorize 替换 emitSecretHandleAudit（caller×source 矩阵校验）
+    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
+    if (!authz.authorized) {
+      const envelope = wrapEnvelope({}, "content_query", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
+      return reply.code(403).send(envelope);
+    }
+    const body = req.body as any;
+    const provider = (body.provider as Provider) || "self";
+    const { backendType, providerHandle } = await resolveProviderPath("content_query", provider);
     const { envelope, status } = await handle(
       "content_query",
-      () => queryBusiness(db, (req.body as any).query, ctx),
+      () => backendType === "third_party_api"
+        ? fetchThirdParty({
+            kind: "content_query",
+            request: body.query ?? {},
+            providerHandle,
+            provider,
+            store: secretStore,
+            caller: "content-backend",
+            providerBaseUrl: providerBaseUrl[provider] ?? "",
+          }).then(toHandlerResult)
+        : queryBusiness(db, body.query, ctx),
       "", // query 无 track_id，占位 ""（block policy 全 kind 全 track 命中；空集 allow）
       requestRegion,
     );
@@ -175,11 +266,29 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
   app.post("/content_match", async (req, reply) => {
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
+    const caller = (req.headers["x-caller-identity"] as string) || "anonymous";
     const traceId = (req.headers["x-trace-id"] as string) || undefined;
-    await emitSecretHandleAudit(auditSink, secretHandle, actor, traceId);
+    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
+    if (!authz.authorized) {
+      const envelope = wrapEnvelope({}, "content_match", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
+      return reply.code(403).send(envelope);
+    }
+    const body = req.body as any;
+    const provider = (body.provider as Provider) || "self";
+    const { backendType, providerHandle } = await resolveProviderPath("content_match", provider);
     const { envelope, status } = await handle(
       "content_match",
-      () => matchBusiness(db, (req.body as any).match, ctx),
+      () => backendType === "third_party_api"
+        ? fetchThirdParty({
+            kind: "content_match",
+            request: body.match ?? {},
+            providerHandle,
+            provider,
+            store: secretStore,
+            caller: "content-backend",
+            providerBaseUrl: providerBaseUrl[provider] ?? "",
+          }).then(toHandlerResult)
+        : matchBusiness(db, body.match, ctx),
       "", // match 无 track_id，占位 ""
       requestRegion,
     );
@@ -189,11 +298,28 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const tid = (req.body as any).track_id;
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
+    const caller = (req.headers["x-caller-identity"] as string) || "anonymous";
     const traceId = (req.headers["x-trace-id"] as string) || undefined;
-    await emitSecretHandleAudit(auditSink, secretHandle, actor, traceId);
+    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
+    if (!authz.authorized) {
+      const envelope = wrapEnvelope({}, "content_stream", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
+      return reply.code(403).send(envelope);
+    }
+    const { provider } = parseTrackId(tid);
+    const { backendType, providerHandle } = await resolveProviderPath("content_stream", provider);
     const { envelope, status } = await handle(
       "content_stream",
-      () => streamBusiness(db, presign, tid, ctx),
+      () => backendType === "third_party_api"
+        ? fetchThirdParty({
+            kind: "content_stream",
+            request: { track_id: tid },
+            providerHandle,
+            provider,
+            store: secretStore,
+            caller: "content-backend",
+            providerBaseUrl: providerBaseUrl[provider] ?? "",
+          }).then(toHandlerResult)
+        : streamBusiness(db, presign, tid, ctx),
       tid,
       requestRegion,
     );
@@ -203,11 +329,28 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const tid = (req.body as any).track_id;
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
+    const caller = (req.headers["x-caller-identity"] as string) || "anonymous";
     const traceId = (req.headers["x-trace-id"] as string) || undefined;
-    await emitSecretHandleAudit(auditSink, secretHandle, actor, traceId);
+    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
+    if (!authz.authorized) {
+      const envelope = wrapEnvelope({}, "content_lyrics", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
+      return reply.code(403).send(envelope);
+    }
+    const { provider } = parseTrackId(tid);
+    const { backendType, providerHandle } = await resolveProviderPath("content_lyrics", provider);
     const { envelope, status } = await handle(
       "content_lyrics",
-      () => lyricsBusiness(db, tid, ctx),
+      () => backendType === "third_party_api"
+        ? fetchThirdParty({
+            kind: "content_lyrics",
+            request: { track_id: tid },
+            providerHandle,
+            provider,
+            store: secretStore,
+            caller: "content-backend",
+            providerBaseUrl: providerBaseUrl[provider] ?? "",
+          }).then(toHandlerResult)
+        : lyricsBusiness(db, tid, ctx),
       tid,
       requestRegion,
     );
@@ -217,11 +360,28 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const tid = (req.body as any).track_id;
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
+    const caller = (req.headers["x-caller-identity"] as string) || "anonymous";
     const traceId = (req.headers["x-trace-id"] as string) || undefined;
-    await emitSecretHandleAudit(auditSink, secretHandle, actor, traceId);
+    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
+    if (!authz.authorized) {
+      const envelope = wrapEnvelope({}, "content_metadata", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
+      return reply.code(403).send(envelope);
+    }
+    const { provider } = parseTrackId(tid);
+    const { backendType, providerHandle } = await resolveProviderPath("content_metadata", provider);
     const { envelope, status } = await handle(
       "content_metadata",
-      () => metadataBusiness(db, tid, ctx),
+      () => backendType === "third_party_api"
+        ? fetchThirdParty({
+            kind: "content_metadata",
+            request: { track_id: tid },
+            providerHandle,
+            provider,
+            store: secretStore,
+            caller: "content-backend",
+            providerBaseUrl: providerBaseUrl[provider] ?? "",
+          }).then(toHandlerResult)
+        : metadataBusiness(db, tid, ctx),
       tid,
       requestRegion,
     );
