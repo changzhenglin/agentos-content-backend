@@ -43,22 +43,25 @@ describe("drift", () => {
     // token_ref type 对齐
     expect(authDef.properties.token_ref.type).toBe("string");
 
-    // per-source pattern 对齐：backend_issued → ^backend:[a-zA-Z0-9_-]+$
+    // per-source pattern 对齐：backend_issued → ^\^backend:[a-zA-Z0-9_-]+$
+    // （AgentOS main 63843f6 修复：^ anchor 误用为字面 caret，pattern 现匹配带 caret 的
+    // 生产 handle 如 `^backend:qq-token_v1`，对齐 cloud-ext `^cloud:` 约定 + option A 生产格式）
     const backendIssuedBranch = authDef.allOf.find(
       (b: any) =>
         b.if?.properties?.token_source?.const === "backend_issued",
     );
     expect(backendIssuedBranch).toBeDefined();
     expect(backendIssuedBranch.then.properties.token_ref.pattern).toBe(
-      "^backend:[a-zA-Z0-9_-]+$",
+      "^\\^backend:[a-zA-Z0-9_-]+$",
     );
 
     // 静态校验 AuthConfig 类型可承载 schema 约束（编译期断言）
+    // token_ref 用生产值 `^backend:qq-token_v1`（带 caret，对齐 fixed schema pattern）
     const cfg: AuthConfig = {
       token_source: "backend_issued",
-      token_ref: "backend:qq-token_v1",
+      token_ref: "^backend:qq-token_v1",
     };
     expect(cfg.token_source).toBe("backend_issued");
-    expect(cfg.token_ref).toMatch(/^backend:[a-zA-Z0-9_-]+$/);
+    expect(cfg.token_ref).toMatch(/^\^backend:[a-zA-Z0-9_-]+$/);
   });
 });

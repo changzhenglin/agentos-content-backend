@@ -44,6 +44,18 @@ import { selectPath } from "./content/path-select.js";
 import { parseTrackId, type Provider } from "./content/track-id.js";
 import { createStubSecretStore, type SecretStore } from "./auth/secret-store-stub.js";
 
+// P1.1 inbound caller 白名单：HTTP inbound 仅接受 cloud-ext external caller。
+// content-backend principal 仅用于内部 fetchThirdParty→resolveHandle（不经 HTTP inbound），
+// 故 HTTP 伪造 X-Caller-Identity: content-backend / ops-platform / unknown / 缺失
+// 一律归一化为 anonymous → 不在 ALLOW_MATRIX → receiveAndAuthorize 拒收 caller_not_allowed。
+// 防御 silent bypass：HTTP 伪造 content-backend + ^backend:foo 不再 authorized。
+const INBOUND_ALLOWED_CALLERS = ["cloud-ext"] as const;
+function normalizeInboundCaller(raw: unknown): string {
+  return typeof raw === "string" && (INBOUND_ALLOWED_CALLERS as readonly string[]).includes(raw)
+    ? raw
+    : "anonymous";
+}
+
 // ajv compile content-contract schema + 预加载外部 $ref（track / runtime-mode）。
 // $ref 指向 https://agentos.dev/schemas/*.schema.json，按 $id 注册（解 I3：完整实现非注释）。
 const contentSchema = JSON.parse(
@@ -256,7 +268,7 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
   app.post("/content_query", async (req, reply) => {
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
-    const caller = (req.headers["x-caller-identity"] as string) || "anonymous";
+    const caller = normalizeInboundCaller(req.headers["x-caller-identity"]);
     const traceId = (req.headers["x-trace-id"] as string) || undefined;
     // M2d: receiveAndAuthorize 替换 emitSecretHandleAudit（caller×source 矩阵校验）
     const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
@@ -288,7 +300,7 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
   app.post("/content_match", async (req, reply) => {
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
-    const caller = (req.headers["x-caller-identity"] as string) || "anonymous";
+    const caller = normalizeInboundCaller(req.headers["x-caller-identity"]);
     const traceId = (req.headers["x-trace-id"] as string) || undefined;
     const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
     if (!authz.authorized) {
@@ -320,7 +332,7 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const tid = (req.body as any).track_id;
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
-    const caller = (req.headers["x-caller-identity"] as string) || "anonymous";
+    const caller = normalizeInboundCaller(req.headers["x-caller-identity"]);
     const traceId = (req.headers["x-trace-id"] as string) || undefined;
     const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
     if (!authz.authorized) {
@@ -351,7 +363,7 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const tid = (req.body as any).track_id;
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
-    const caller = (req.headers["x-caller-identity"] as string) || "anonymous";
+    const caller = normalizeInboundCaller(req.headers["x-caller-identity"]);
     const traceId = (req.headers["x-trace-id"] as string) || undefined;
     const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
     if (!authz.authorized) {
@@ -382,7 +394,7 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const tid = (req.body as any).track_id;
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
-    const caller = (req.headers["x-caller-identity"] as string) || "anonymous";
+    const caller = normalizeInboundCaller(req.headers["x-caller-identity"]);
     const traceId = (req.headers["x-trace-id"] as string) || undefined;
     const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
     if (!authz.authorized) {

@@ -7,6 +7,10 @@
 //   3. content_policy push（rule_id=qq, action=allow, auth_config.token_ref=^backend:qq-token_v1）
 //      + request provider=qq + PROVIDER_AVAILABLE 默认 true → 200 third_party_api/real DONE
 //      + mock provider 收 Bearer mock-qq-token
+//   4. P1.1 spoof 防御：HTTP 伪造 X-Caller-Identity: content-backend + ^backend:foo
+//      → 403 BLOCKED + audit unauthorized（caller normalized to anonymous → caller_not_allowed）
+//   5. P1.1 缺失 caller：HTTP 无 X-Caller-Identity（anonymous）+ ^backend:foo
+//      → 403 caller_not_allowed
 //
 // 复用 server.e2e.test.ts 模式（buildServer + inject + pg-mem ContentDb）。
 // third_party case 复用 third-party-adapter.test.ts 模式（undici MockAgent + mock-provider fixture）。
@@ -209,5 +213,71 @@ describe("route-authorize e2e (Task 6)", () => {
     expect(body.candidates[0].track_id).toBe("qq:t1");
     // mock provider 收 Bearer mock-qq-token（transport 实质验证 D9）
     expect(mp.receivedAuths.qq).toBe("Bearer mock-qq-token");
+  });
+
+  it("case 4: P1.1 spoof 防御 — HTTP 伪造 X-Caller-Identity: content-backend + ^backend:foo → 403 BLOCKED + audit unauthorized (caller normalized to anonymous → caller_not_allowed)", async () => {
+    const db = createTestDb();
+    await seedTrack(db, base);
+    const policyStore = createPolicyStore(db);
+    const auditSink = createAuditSink(auditPath);
+    const app = await buildServer({
+      db,
+      policyStore,
+      auditSink,
+      actor: "anonymous-service",
+    });
+
+    // HTTP inbound 伪造 content-backend principal（P1.1 白名单只接受 cloud-ext external）
+    const r = await app.inject({
+      method: "POST",
+      url: "/content_query",
+      headers: {
+        "x-secret-handle": "^backend:foo",
+        "x-caller-identity": "content-backend",
+        "x-trace-id": "trace-case-4",
+      },
+      payload: { query: { keywords: ["Sunrise"] } },
+    });
+
+    expect(r.statusCode).toBe(403);
+    const body = r.json();
+    expect(body.completion_state).toBe("BLOCKED");
+    expect(body.error_code).toBe("AUTH_FAILED");
+
+    // caller 被白名单归一化为 anonymous → 不在 ALLOW_MATRIX → caller_not_allowed
+    const auditContent = readFileSync(auditPath, "utf8");
+    expect(auditContent).toContain("unauthorized:caller_not_allowed");
+    expect(auditContent).toContain("secret_handle:^backend:foo");
+  });
+
+  it("case 5: P1.1 缺失 caller — HTTP 无 X-Caller-Identity（anonymous）+ ^backend:foo → 403 caller_not_allowed", async () => {
+    const db = createTestDb();
+    await seedTrack(db, base);
+    const policyStore = createPolicyStore(db);
+    const auditSink = createAuditSink(auditPath);
+    const app = await buildServer({
+      db,
+      policyStore,
+      auditSink,
+      actor: "anonymous-service",
+    });
+
+    const r = await app.inject({
+      method: "POST",
+      url: "/content_query",
+      headers: {
+        "x-secret-handle": "^backend:foo",
+        "x-trace-id": "trace-case-5",
+      },
+      payload: { query: { keywords: ["Sunrise"] } },
+    });
+
+    expect(r.statusCode).toBe(403);
+    const body = r.json();
+    expect(body.completion_state).toBe("BLOCKED");
+    expect(body.error_code).toBe("AUTH_FAILED");
+
+    const auditContent = readFileSync(auditPath, "utf8");
+    expect(auditContent).toContain("unauthorized:caller_not_allowed");
   });
 });
