@@ -11,6 +11,16 @@ export interface SecurityContext {
   expiry: string;
 }
 
+// M2d Task 3: auth_config 对齐 AgentOS ops-config.schema.json 的 auth_config def
+// （option A：单 string token_ref，不改 AgentOS 仓）。
+// - token_source: enum ["ops_managed", "backend_issued"]（对齐 schema $defs.auth_config.properties.token_source.enum）
+// - token_ref: 单段 ^backend:<provider>-<id>（hyphen 分隔，fit ^backend:[a-zA-Z0-9_-]+$，
+//   不允许冒号多段）；runtime 由 secret store resolver 换真实 token
+export interface AuthConfig {
+  token_source: "ops_managed" | "backend_issued";
+  token_ref: string;
+}
+
 export interface PolicyEnvelope {
   command_id: string;
   kind: "content_policy";
@@ -20,6 +30,7 @@ export interface PolicyEnvelope {
     rule_id: string;
     action: "allow" | "block" | "region_restrict";
     target_scope: string;
+    auth_config?: AuthConfig; // M2d: 加（对齐 ops-config.schema.json content_policy.auth_config）
   };
   security_context: SecurityContext;
 }
