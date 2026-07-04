@@ -34,6 +34,7 @@ import type { Kind, BackendType, CapabilityMode, Outcome, ErrorCode } from "./en
 import type { PolicyStore } from "./policy/policy-store.js";
 import { createPolicyStore } from "./policy/policy-store.js";
 import type { AuditSink } from "./audit/audit-sink.js";
+import { createAuditSink } from "./audit/audit-sink.js";
 import type { DrmCtx } from "./policy/drm-ctx.js";
 import { drmGuard } from "./policy/drm-guard.js";
 import { getRegion } from "./policy/region-config.js";
@@ -107,7 +108,10 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
   // 既有 e2e 未传 policyStore 时用默认 store（空集 policy→allow），行为不回归；
   // drm 默认生效（空集 allow），生产路径注入 auditSink 即有 audit emit。
   const policyStore: PolicyStore = opts.policyStore ?? createPolicyStore(db);
-  const auditSink: AuditSink | undefined = opts.auditSink;
+  // CLI 路径默认从 env.auditSinkPath wire createAuditSink（opts.auditSink 优先注入测试用），
+  // 否则 X-Secret-Handle audit hook 在 CLI 模式 no-op（Task 1 遗漏 wiring，e2e surfacing 补）。
+  const auditSink: AuditSink | undefined =
+    opts.auditSink ?? (env.auditSinkPath ? createAuditSink(env.auditSinkPath) : undefined);
   const actor = opts.actor ?? "anonymous-service";
   const ctx: DrmCtx = { policyStore, auditSink, actor };
 
