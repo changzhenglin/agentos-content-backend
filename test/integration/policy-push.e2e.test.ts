@@ -207,6 +207,14 @@ describe("content_policy push e2e", () => {
     expect(r.body.error_code).toBe("ENVELOPE_EXPIRED");
   });
 
+  it("expiry 非日期字符串（NaN）→ 403 ENVELOPE_EXPIRED（fold codex P1#2：Number.isFinite 防 NaN 通过）", async () => {
+    const env = envelope("content_backend", "cmd-nan");
+    (env as any).security_context.expiry = "not-a-date";
+    const r = await postPush(env);
+    expect(r.status).toBe(403);
+    expect(r.body.error_code).toBe("ENVELOPE_EXPIRED");
+  });
+
   it("actor ≠ callerIdentity（self-declared 不信，fold codex P2）→ 403 UNAUTHORIZED_ACTOR", async () => {
     const r = await postPush(
       envelope("content_backend", "cmd-actor", "block", 60000, 1, "fake-actor"),

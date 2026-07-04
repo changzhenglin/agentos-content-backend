@@ -140,8 +140,9 @@ export async function buildOpsApp(opts: BuildOpsAppOpts) {
       });
       return reply.code(403).send(errBody("AUDIENCE_MISMATCH", "audience mismatch"));
     }
-    // expiry 校验
-    if (new Date(sc.expiry).getTime() < Date.now()) {
+    // expiry 校验（fold codex P1#2：Number.isFinite 防 NaN 通过——new Date(invalid).getTime()=NaN，NaN < Date.now()=false 会放行无效 expiry）
+    const expiryMs = new Date(sc.expiry).getTime();
+    if (!Number.isFinite(expiryMs) || expiryMs <= Date.now()) {
       await emitUnauthorized(opts.auditSink, {
         caller,
         reason: "envelope_expired",

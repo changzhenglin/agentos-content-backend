@@ -103,7 +103,7 @@ describe("admin UI e2e", () => {
     expect(t.body).toContain("self:t2");
   });
 
-  it("reject → 200 + HTML partial（fold design I2，reject 显式 route）", async () => {
+  it("reject → 200 + HTML partial + emit revoke audit（fold codex P1#4：spec §8.3 reject 也 emit revoke）", async () => {
     const cookie = await login("dev-admin");
     const ing = await app.inject({
       method: "POST",
@@ -117,6 +117,11 @@ describe("admin UI e2e", () => {
       headers: { cookie },
     });
     expect(r.statusCode).toBe(200);
+    // spec §8.3 audit matrix：rejected/revoked → revoke；reject 须 emit revoke（target=trackId 非空）
+    const lines = readFileSync(auditPath, "utf8").trim().split("\n");
+    const ev = JSON.parse(lines[lines.length - 1]);
+    expect(ev.eventType).toBe("revoke");
+    expect(ev.target).toBe("self:t3");
   });
 
   it("operator 不能 ingest（admin only）→ 403", async () => {

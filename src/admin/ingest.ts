@@ -63,9 +63,9 @@ export async function ingestTransitionAndAudit(
   if (action === "approve" && trackId) {
     await emitProvision(auditSink, { ingestId, trackId, actor });
   }
-  if (action === "revoke" && trackId) {
+  // fold codex P1#4：spec §8.3 audit matrix 行"审核拒绝/下架（rejected/revoked）→revoke"——reject 也 emit revoke
+  if ((action === "reject" || action === "revoke") && trackId) {
     await emitRevoke(auditSink, { trackId, actor });
   }
-  // reject 不 emit provision/revoke（仅状态转移+review 记录）
   return { trackId };
 }
