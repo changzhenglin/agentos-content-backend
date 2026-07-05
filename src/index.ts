@@ -39,6 +39,7 @@ import type { DrmCtx } from "./policy/drm-ctx.js";
 import { drmGuard } from "./policy/drm-guard.js";
 import { getRegion } from "./policy/region-config.js";
 import { receiveAndAuthorize } from "./auth/secret-handle-hook.js";
+import { authorizeBackendType } from "./auth/caller-auth-matrix.js";
 import { fetchThirdParty } from "./content/third-party-adapter.js";
 import { selectPath } from "./content/path-select.js";
 import { parseTrackId, type Provider } from "./content/track-id.js";
@@ -49,7 +50,7 @@ import { createStubSecretStore, type SecretStore } from "./auth/secret-store-stu
 // 故 HTTP 伪造 X-Caller-Identity: content-backend / ops-platform / unknown / 缺失
 // 一律归一化为 anonymous → 不在 ALLOW_MATRIX → receiveAndAuthorize 拒收 caller_not_allowed。
 // 防御 silent bypass：HTTP 伪造 content-backend + ^backend:foo 不再 authorized。
-const INBOUND_ALLOWED_CALLERS = ["cloud-ext"] as const;
+const INBOUND_ALLOWED_CALLERS = ["cloud-ext", "device-hub"] as const;
 function normalizeInboundCaller(raw: unknown): string {
   return typeof raw === "string" && (INBOUND_ALLOWED_CALLERS as readonly string[]).includes(raw)
     ? raw
@@ -279,6 +280,11 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const body = req.body as any;
     const provider = (body.provider as Provider) || "self";
     const { backendType, providerHandle } = await resolveProviderPath("content_query", provider);
+    const btAuthz = authorizeBackendType(caller, backendType);
+    if (!btAuthz.authorized) {
+      const envelope = wrapEnvelope({}, "content_query", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
+      return reply.code(403).send(envelope);
+    }
     const { envelope, status } = await handle(
       "content_query",
       () => backendType === "third_party_api"
@@ -310,6 +316,11 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const body = req.body as any;
     const provider = (body.provider as Provider) || "self";
     const { backendType, providerHandle } = await resolveProviderPath("content_match", provider);
+    const btAuthz = authorizeBackendType(caller, backendType);
+    if (!btAuthz.authorized) {
+      const envelope = wrapEnvelope({}, "content_match", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
+      return reply.code(403).send(envelope);
+    }
     const { envelope, status } = await handle(
       "content_match",
       () => backendType === "third_party_api"
@@ -341,6 +352,11 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     }
     const { provider } = parseTrackId(tid);
     const { backendType, providerHandle } = await resolveProviderPath("content_stream", provider);
+    const btAuthz = authorizeBackendType(caller, backendType);
+    if (!btAuthz.authorized) {
+      const envelope = wrapEnvelope({}, "content_stream", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
+      return reply.code(403).send(envelope);
+    }
     const { envelope, status } = await handle(
       "content_stream",
       () => backendType === "third_party_api"
@@ -372,6 +388,11 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     }
     const { provider } = parseTrackId(tid);
     const { backendType, providerHandle } = await resolveProviderPath("content_lyrics", provider);
+    const btAuthz = authorizeBackendType(caller, backendType);
+    if (!btAuthz.authorized) {
+      const envelope = wrapEnvelope({}, "content_lyrics", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
+      return reply.code(403).send(envelope);
+    }
     const { envelope, status } = await handle(
       "content_lyrics",
       () => backendType === "third_party_api"
@@ -403,6 +424,11 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     }
     const { provider } = parseTrackId(tid);
     const { backendType, providerHandle } = await resolveProviderPath("content_metadata", provider);
+    const btAuthz = authorizeBackendType(caller, backendType);
+    if (!btAuthz.authorized) {
+      const envelope = wrapEnvelope({}, "content_metadata", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
+      return reply.code(403).send(envelope);
+    }
     const { envelope, status } = await handle(
       "content_metadata",
       () => backendType === "third_party_api"
