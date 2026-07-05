@@ -68,12 +68,11 @@ openclaw agent → cloud-ext content-adapter/music-query-tool (caller=cloud-ext,
 
 ### U2. content-backend `device-capability-filter`（新建）
 
-- 5 kind 入口收 `X-Device-Capability` header（端侧能力 mode JSON：支持的 kind/format/bitrate/region）
-- drm-guard **前置**能力筛选（端侧能力不支持 → 降级或 BLOCKED）
-- capability_policy 与 drm_rule 正交：drm 管版权/region，capability 管设备能力
+- 5 kind 入口收 `X-Device-Capability` header（端侧能力 mode JSON：支持的 kind/format/bitrate/region），drm-guard **前置**能力筛选（端侧能力不支持 → 降级或 BLOCKED）
+- **device_capability vs capability_policy 区分**（review fold A3 消歧）：`capability_policy` 是 ops 下发**给端侧**的（窗口B spec，端侧持），`device_capability` 是端侧随 content_request 传给 content-backend 的能力声明（`X-Device-Capability` header）。content-backend **消费 device_capability**（硬件能力筛选：kinds/formats/bitrate），**不消费 capability_policy**（那个归端侧）。两者正交：drm 管版权/region，device_capability 管端侧硬件能力
 - 文件：`src/policy/capability-filter.ts`（新建）+ `src/index.ts` 5 route 接入
-- 依赖：drm-guard（既有）+ capability_policy（ops 下发，content-backend 侧读 latest policy，复用 policyStore）
-- 不做：不签发 capability_policy（归 ops 下发，窗口B）；不存 device_capability（无状态筛选）
+- 依赖：drm-guard（既有）+ device_capability header（端侧传，窗口A 定义 content_request envelope schema 时落地 `device_capability` 字段，sim 阶段用 header）
+- 不做：不签发 capability_policy（归 ops 下发端侧，窗口B）；不存 device_capability（无状态筛选）；不读 ops 下发的 capability_policy rule（那个给端侧，非 content-backend）
 - **降级策略**：format/bitrate 不匹配时优先降级到端侧支持的 format/bitrate（查 tracks 表有无匹配 format），全不支持才 BLOCKED。与 drm block（直接 BLOCKED）不同——capability 是"能不能播"，降级比硬拒友好
 
 ### U3. content-backend `self-hosted-seed`（新建）

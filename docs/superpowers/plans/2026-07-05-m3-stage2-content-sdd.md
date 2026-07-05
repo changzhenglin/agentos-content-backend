@@ -38,9 +38,10 @@
 
 **Files:**
 - Modify: `src/auth/caller-auth-matrix.ts`
-- Modify: `src/auth/secret-handle-hook.ts`
 - Modify: `src/index.ts`（INBOUND_ALLOWED_CALLERS + route 层 backend_type 校验）
 - Test: `test/auth/caller-auth-matrix.test.ts`（新建）+ `test/integration/route-authorize.e2e.test.ts`（扩 case）
+
+> review fold P1#1：`src/auth/secret-handle-hook.ts` **不改**——`receiveAndAuthorize` 的 `!handle` 短路已存在（`secret-handle-hook.ts:74` `if (!handle) return { authorized: true }`），device-hub self_hosted 无 handle 路径经此短路 authorized。本 task 不动该文件（原 plan 列 Modify 是笔误）。
 
 **Interfaces:**
 - Consumes: 既有 `ALLOW_MATRIX`、`receiveAndAuthorize`、`INBOUND_ALLOWED_CALLERS`、`normalizeInboundCaller`
@@ -389,14 +390,16 @@ export async function capabilityFilter(opts: {
   policyStore: PolicyStore;
 }): Promise<CapabilityDecision> {
   const { capability, kind, trackFormat, trackBitrate, policyStore } = opts;
-  // policyStore fail-closed 探测（与 drm-guard 一致：store 故障不 silent allow）
+  // review fold P2#3：无 capability header → 放行（sim trust network）提到 policyStore 探测之前。
+  // 否则 device-hub 不带 cap（sim 常态）+ policyStore 抖动 → BACKEND_UNAVAILABLE，trust-network 旁路失效。
+  if (!capability) return { blocked: false };
+  // policyStore fail-closed 探测（与 drm-guard 一致：store 故障不 silent allow）。
+  // 仅当 capability 存在时才探测 store 健康（无 cap 已放行）。
   try {
     await policyStore.latestPolicy();
   } catch {
     return { blocked: true, errorCode: "BACKEND_UNAVAILABLE" };
   }
-  // 无 capability header → 放行（sim trust network）
-  if (!capability) return { blocked: false };
   // kind 筛选
   if (!capability.kinds.includes(kind)) {
     return { blocked: true, errorCode: "CAPABILITY_UNSUPPORTED" };
@@ -430,22 +433,58 @@ Modify `src/index.ts`，import 块追加：
 import { parseDeviceCapability, capabilityFilter, type DeviceCapability } from "./policy/capability-filter.js";
 ```
 
-在每个 route handler 中，`receiveAndAuthorize` 之后、`resolveProviderPath` 之前，插入 capability-filter。以 `/content_stream` 为例（`src/index.ts:337` 之后，authz 校验后）：
+在每个 route handler 中，`receiveAndAuthorize` 之后、`resolveProviderPath` 之前，插入 capability-filter。以 `/content_stream` 为例（`src/index.ts:337` 之后，authz 校验后）——**review fold A1+P2#4**：stream 先查 tracks format/bitrate 再筛，degraded 传到 envelope：
 
 ```typescript
     const capHeader = req.headers["x-device-capability"] as string | undefined;
     const capability = parseDeviceCapability(capHeader);
-    // stream 需要 track format/bitrate 做能力筛选，但 track format 在 streamBusiness 内查；
-    // sim 阶段：capability-filter 只筛 kind（format/bitrate 在 business 内返后不回溯），
-    // 真机转码 defer。故此处只传 kind（trackFormat 留空，business 返真实 format）。
-    const capDec = await capabilityFilter({ capability, kind: "content_stream", policyStore });
+    // review fold A1：stream 先查 tracks format/bitrate 再调 capability-filter（传 trackFormat/trackBitrate），
+    // 使 format/bitrate 降级生效（spec U2 要求降级优先于 BLOCKED；trackFormat 在 streamBusiness 内查，
+    // capability-filter 在 business 前，故 route 层先查一次 format/bitrate 传给 capability-filter）。
+    const { rows: trackRows } = await db.query(
+      "SELECT format, bitrate FROM tracks WHERE track_id = $1 LIMIT 1",
+      [tid],
+    );
+    const trackFormat = trackRows[0]?.format ? String(trackRows[0].format) : undefined;
+    const trackBitrate = trackRows[0]?.bitrate ? Number(trackRows[0].bitrate) : undefined;
+    const capDec = await capabilityFilter({ capability, kind: "content_stream", trackFormat, trackBitrate, policyStore });
     if (capDec.blocked) {
       const envelope = wrapEnvelope({}, "content_stream", "self_hosted", "unavailable", "blocked", capDec.errorCode);
       return reply.code(403).send(envelope);
     }
+    // review fold P2#4：capDec.degraded 时 envelope capability_mode=degraded（端侧感知降级）。
+    // handle() 返 envelope 后覆盖 capability_mode + completion_state（degraded+ok→DONE_WITH_CONCERNS）。
+    // 注意：需在 handle() 调用后处理，见下。
 ```
 
-query/match/lyrics/metadata 同模式（kind 字面量替换；这 4 kind 无 trackFormat，只筛 kind + policyStore fail-closed）。
+stream route 的 `handle()` 调用后，加 degraded 覆盖：
+
+```typescript
+    const { envelope, status } = await handle(
+      "content_stream",
+      () => backendType === "third_party_api" ? /* 既有 fetchThirdParty 分支 */ : streamBusiness(db, presign, tid, ctx),
+      tid,
+      requestRegion,
+    );
+    // review fold P2#4：degraded 覆盖（capability-filter 算出 degraded，streamBusiness 不感知）
+    if (capDec.degraded && !capDec.blocked) {
+      (envelope as any).capability_mode = "degraded";
+      (envelope as any).completion_state = "DONE_WITH_CONCERNS";
+    }
+    reply.code(status).send(envelope);
+```
+
+query/match/lyrics/metadata 同模式插入 capability-filter，但**无 trackFormat/trackBitrate**（这 4 kind 只筛 kind + policyStore fail-closed），且无 degraded 覆盖（无 bitrate 降级）：
+
+```typescript
+    const capHeader = req.headers["x-device-capability"] as string | undefined;
+    const capability = parseDeviceCapability(capHeader);
+    const capDec = await capabilityFilter({ capability, kind: "content_query" /* 对应 kind */, policyStore });
+    if (capDec.blocked) {
+      const envelope = wrapEnvelope({}, "content_query" /* 对应 kind */, "self_hosted", "unavailable", "blocked", capDec.errorCode);
+      return reply.code(403).send(envelope);
+    }
+```
 
 注意：`policyStore` 在 buildServer 作用域（`src/index.ts:144`），route handler 闭包可访问。
 
@@ -1114,3 +1153,55 @@ git commit -m "test(m3-stage2): e2e mock device-hub caller + self_hosted 真实�
 - content_request schema 落地归窗口A（Task 5 明示）✓
 
 无 spec gap，无 placeholder，类型一致。Plan ready。
+
+---
+
+## REVIEW FOLD（plan-eng + fresh-context subagent，2026-07-05）
+
+> plan-eng-review 3 findings + fresh-context subagent 8 findings（codex gpt-5.5 stream disconnect 降级，见 GSTACK REVIEW REPORT）。已 fold 11 项，P3 minor defer。
+
+### plan-eng findings（3，全 fold）
+- **A1 (P2)** stream format/bitrate 降级未实现 → **fold**：Task 2 Step 5 stream route 先查 tracks format/bitrate 再调 capability-filter（传 trackFormat/trackBitrate），degraded 传到 envelope（与 P2#4 合并）。**已改 Task 2 Step 5 code**。
+- **A3 (P2)** spec U2 "capability_policy 消费" 措辞歧义 → **fold**：修 spec U2 措辞（capability_policy 归端侧 ops 下发，content-backend 消费 device_capability）。**已改 spec**。
+- **C1 (P2)** Task 3/4/6 测试 `require("child_process")` ESM 不兼容 → **fold**：implementer 执行 Task 3/4/6 时，`dockerAvailable()`/`ffmpegAvailable()` 改 `import { execSync } from "node:child_process"`（与既有 m2d-e2e.test.ts 一致）。**implementer 指令**。
+
+### fresh-context subagent findings（8，2 false-positive + 6 fold）
+- **P1#1 (P1, false positive)** secret-handle-hook.ts 列 Modify 无 step → 验证 `secret-handle-hook.ts:74` !handle 短路**存在** → **fold**：Task 1 Files 从 Modify 移除 secret-handle-hook.ts（不改）。**已改 Task 1 Files**。
+- **P1#2 (P1, sim known hole)** device-hub 伪 X-Caller-Identity: cloud-ext + 无 handle → !handle 短路 authorized as cloud-ext → 可调 third_party（矩阵被 header 伪造击穿）。M2d 既有 cloud-ext 无 handle + third_party 200 是设计行为，加 handle 要求会破坏。→ **fold A（老林确认）**：记 sim known hole + Task 6 加 test 验证 spoof 路径（device-hub 伪 cloud-ext + 无 handle + provider=qq → 当前 200，标 known hole）+ mTLS remediation（真机/M5 绑定 caller cert）。与 spec D5 sim 明文 + mTLS defer 一致。**implementer 指令：Task 6 加 #6 test**。
+- **P2#3 (P2)** capability-filter fail-closed 探测在 !capability 短路之前 → **fold**：!capability 短路提到 policyStore 探测之前。**已改 Task 2 Step 3 code**。**implementer 指令：Task 2 Step 1 单测加 "无 cap + failStore → 放行" case**（验证短路顺序）。
+- **P2#4 (P2)** capabilityFilter 返 degraded 但 route 层 wrapEnvelope 没设 capability_mode=degraded → **fold**：stream route handle() 后覆盖 envelope.capability_mode=degraded + completion_state=DONE_WITH_CONCERNS。**已改 Task 2 Step 5 code**。**implementer 指令：Task 4/6 加 degraded 路径测试**（trackBitrate 320000 + maxBitrate 128000 → DONE_WITH_CONCERNS + capability_mode=degraded）。
+- **P2#5 (P2)** spec §5.3 e2e 要求 audit JSONL hash chain 验证，Task 6 无 audit 断言 → **fold**：Task 6 加 #7 test（读 auditPath JSONL，断言 device-hub actor 记录 + hash chain，复用 m2b/m2d audit 校验范式）。**implementer 指令：Task 6 加 #7**。
+- **P2#6 (P2)** Task 6 #2 只测 body provider=qq，未测 track_id 前缀驱动 third_party 路径 → **fold**：Task 6 加 #8 test（device-hub + track_id="qq:xxx" 无 provider 字段 → 403 AUTH_FAILED，验证 authorizeBackendType 拦 track_id 前缀解析的 third_party 路径）。**implementer 指令：Task 6 加 #8**。
+- **P2#7 (P2, false positive)** Task 4 buildServer({db,s3,bucket}) in-process 注入 → 验证 `index.ts:124 BuildServerOpts` 接受 db/s3/bucket/presign/... → **fold**：plan 注释引用 BuildServerOpts 签名。**已验证接受，implementer 按既有签名注入**。
+- **P3#8 (P3)** migration 文件名硬编码 3 处 → **fold**：Task 3/4/6 改 `readdirSync(MIGRATIONS_DIR).sort()` 动态读 migration 文件。**implementer 指令**。
+
+### P3 minor defer（不 fold，sim 可接受）
+- A2 latestPolicy 两次调用（capability-filter + drm-guard）——sim 可接受，生产缓存 defer
+- C2 5 route authorizeBackendType 重复——surgical 沿用既有 5 route 重复模式，抽 helper defer
+- C3 seed SEED_TRACKS hardcoded 2 首——sim 占位可接受
+- T1 device-hub caller audit——与 P2#5 合并 fold
+- T2 lyrics restricted blocked 集成层——M2b 单测已覆盖 lyricsBusiness restricted 逻辑，集成层 defer
+- P1 perf latestPolicy 两次——同 A2
+- P2 perf queryTracks ILIKE 全表扫——sim 小库可接受，生产 GIN/trigram 索引 defer
+
+### 降级记录（model-routing §3）
+- codex gpt-5.5 实际调用（model: gpt-5.5, provider: custom, token.longshine.com）但 stream disconnect（2 次重试均 5/5 reconnect 失败）
+- 替代 = fresh-context 同模型 subagent（独立上下文，**非跨厂商**——同模型 glm-5.2[1m] family）
+- 剩余风险：content-contract 公共 contract 强制子集的**跨厂商盲点未覆盖**（codex 独有 catch 缺失，如 M2c/M2d codex 曾 catch ESM/blast radius/Dockerfile）
+- codex 恢复（网络恢复）后可补跑 codex plan review
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
+| Codex Review | `/codex review` | Independent 2nd opinion | 1 | DEGRADED | stream disconnect, fresh-context subagent 替代（非跨厂商），6 findings fold |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR | 3 findings, 3 fold (A1/A3/C1) |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
+
+- **CODEX:** DEGRADED — codex gpt-5.5 stream disconnect（token.longshine.com 网络问题，2 次重试失败），fresh-context 同模型 subagent 替代，6 findings 全 fold（P1#2 sim known hole + P2#3/#4/#5/#6 + P3#8）；跨厂商盲点未覆盖，codex 恢复后补跑。
+- **CROSS-MODEL:** 不可用（codex 未产出结论，无跨模型对照）；fresh-context subagent 与主 session 同模型，非跨厂商。
+- **VERDICT:** ENG CLEARED — 3 findings 全 fold；fresh-context subagent 6 findings 全 fold（含 P1#2 sim known hole 记录 + remediation）；codex 跨厂商降级（网络，非 auth），替代审查已 fold，剩余风险记录。plan v2 ready for executing-plans。
+
+NO UNRESOLVED DECISIONS
