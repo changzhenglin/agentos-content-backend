@@ -39,6 +39,8 @@ import type { DrmCtx } from "./policy/drm-ctx.js";
 import { drmGuard } from "./policy/drm-guard.js";
 import { getRegion } from "./policy/region-config.js";
 import { receiveAndAuthorize } from "./auth/secret-handle-hook.js";
+import { authorizeBackendType } from "./auth/caller-auth-matrix.js";
+import { parseDeviceCapability, capabilityFilter } from "./policy/capability-filter.js";
 import { fetchThirdParty } from "./content/third-party-adapter.js";
 import { selectPath } from "./content/path-select.js";
 import { parseTrackId, type Provider } from "./content/track-id.js";
@@ -49,7 +51,7 @@ import { createStubSecretStore, type SecretStore } from "./auth/secret-store-stu
 // 故 HTTP 伪造 X-Caller-Identity: content-backend / ops-platform / unknown / 缺失
 // 一律归一化为 anonymous → 不在 ALLOW_MATRIX → receiveAndAuthorize 拒收 caller_not_allowed。
 // 防御 silent bypass：HTTP 伪造 content-backend + ^backend:foo 不再 authorized。
-const INBOUND_ALLOWED_CALLERS = ["cloud-ext"] as const;
+const INBOUND_ALLOWED_CALLERS = ["cloud-ext", "device-hub"] as const;
 function normalizeInboundCaller(raw: unknown): string {
   return typeof raw === "string" && (INBOUND_ALLOWED_CALLERS as readonly string[]).includes(raw)
     ? raw
@@ -279,6 +281,19 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const body = req.body as any;
     const provider = (body.provider as Provider) || "self";
     const { backendType, providerHandle } = await resolveProviderPath("content_query", provider);
+    const btAuthz = authorizeBackendType(caller, backendType);
+    if (!btAuthz.authorized) {
+      const envelope = wrapEnvelope({}, "content_query", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
+      return reply.code(403).send(envelope);
+    }
+    // T2 capability-filter（query 只筛 kind）
+    const capHeader = req.headers["x-device-capability"] as string | undefined;
+    const capability = parseDeviceCapability(capHeader);
+    const capDec = await capabilityFilter({ capability, kind: "content_query", policyStore });
+    if (capDec.blocked) {
+      const envelope = wrapEnvelope({}, "content_query", "self_hosted", "unavailable", "blocked", capDec.errorCode);
+      return reply.code(403).send(envelope);
+    }
     const { envelope, status } = await handle(
       "content_query",
       () => backendType === "third_party_api"
@@ -310,6 +325,19 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const body = req.body as any;
     const provider = (body.provider as Provider) || "self";
     const { backendType, providerHandle } = await resolveProviderPath("content_match", provider);
+    const btAuthz = authorizeBackendType(caller, backendType);
+    if (!btAuthz.authorized) {
+      const envelope = wrapEnvelope({}, "content_match", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
+      return reply.code(403).send(envelope);
+    }
+    // T2 capability-filter（match 只筛 kind）
+    const capHeader = req.headers["x-device-capability"] as string | undefined;
+    const capability = parseDeviceCapability(capHeader);
+    const capDec = await capabilityFilter({ capability, kind: "content_match", policyStore });
+    if (capDec.blocked) {
+      const envelope = wrapEnvelope({}, "content_match", "self_hosted", "unavailable", "blocked", capDec.errorCode);
+      return reply.code(403).send(envelope);
+    }
     const { envelope, status } = await handle(
       "content_match",
       () => backendType === "third_party_api"
@@ -341,6 +369,25 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     }
     const { provider } = parseTrackId(tid);
     const { backendType, providerHandle } = await resolveProviderPath("content_stream", provider);
+    const btAuthz = authorizeBackendType(caller, backendType);
+    if (!btAuthz.authorized) {
+      const envelope = wrapEnvelope({}, "content_stream", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
+      return reply.code(403).send(envelope);
+    }
+    // T2 A1: stream 先查 tracks format/bitrate 再 capability-filter（使 format/bitrate 降级生效）
+    const capHeader = req.headers["x-device-capability"] as string | undefined;
+    const capability = parseDeviceCapability(capHeader);
+    const { rows: trackRows } = await db.query(
+      "SELECT format, bitrate FROM tracks WHERE track_id = $1 LIMIT 1",
+      [tid],
+    );
+    const trackFormat = trackRows[0]?.format ? String(trackRows[0].format) : undefined;
+    const trackBitrate = trackRows[0]?.bitrate ? Number(trackRows[0].bitrate) : undefined;
+    const capDec = await capabilityFilter({ capability, kind: "content_stream", trackFormat, trackBitrate, policyStore });
+    if (capDec.blocked) {
+      const envelope = wrapEnvelope({}, "content_stream", "self_hosted", "unavailable", "blocked", capDec.errorCode);
+      return reply.code(403).send(envelope);
+    }
     const { envelope, status } = await handle(
       "content_stream",
       () => backendType === "third_party_api"
@@ -357,6 +404,12 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
       tid,
       requestRegion,
     );
+    // T2 P2#4: degraded 覆盖 envelope（capability-filter 算出 degraded，streamBusiness 不感知）
+    // review fold I1: 仅成功路径（DONE）才标降级，避免掩盖 drm block / no_result / unavailable
+    if (capDec.degraded && !capDec.blocked && (envelope as any).completion_state === "DONE") {
+      (envelope as any).capability_mode = "degraded";
+      (envelope as any).completion_state = "DONE_WITH_CONCERNS";
+    }
     reply.code(status).send(envelope);
   });
   app.post("/content_lyrics", async (req, reply) => {
@@ -372,6 +425,19 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     }
     const { provider } = parseTrackId(tid);
     const { backendType, providerHandle } = await resolveProviderPath("content_lyrics", provider);
+    const btAuthz = authorizeBackendType(caller, backendType);
+    if (!btAuthz.authorized) {
+      const envelope = wrapEnvelope({}, "content_lyrics", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
+      return reply.code(403).send(envelope);
+    }
+    // T2 capability-filter（lyrics 只筛 kind）
+    const capHeader = req.headers["x-device-capability"] as string | undefined;
+    const capability = parseDeviceCapability(capHeader);
+    const capDec = await capabilityFilter({ capability, kind: "content_lyrics", policyStore });
+    if (capDec.blocked) {
+      const envelope = wrapEnvelope({}, "content_lyrics", "self_hosted", "unavailable", "blocked", capDec.errorCode);
+      return reply.code(403).send(envelope);
+    }
     const { envelope, status } = await handle(
       "content_lyrics",
       () => backendType === "third_party_api"
@@ -403,6 +469,19 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     }
     const { provider } = parseTrackId(tid);
     const { backendType, providerHandle } = await resolveProviderPath("content_metadata", provider);
+    const btAuthz = authorizeBackendType(caller, backendType);
+    if (!btAuthz.authorized) {
+      const envelope = wrapEnvelope({}, "content_metadata", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
+      return reply.code(403).send(envelope);
+    }
+    // T2 capability-filter（metadata 只筛 kind）
+    const capHeader = req.headers["x-device-capability"] as string | undefined;
+    const capability = parseDeviceCapability(capHeader);
+    const capDec = await capabilityFilter({ capability, kind: "content_metadata", policyStore });
+    if (capDec.blocked) {
+      const envelope = wrapEnvelope({}, "content_metadata", "self_hosted", "unavailable", "blocked", capDec.errorCode);
+      return reply.code(403).send(envelope);
+    }
     const { envelope, status } = await handle(
       "content_metadata",
       () => backendType === "third_party_api"

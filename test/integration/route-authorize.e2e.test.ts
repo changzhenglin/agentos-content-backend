@@ -280,4 +280,35 @@ describe("route-authorize e2e (Task 6)", () => {
     const auditContent = readFileSync(auditPath, "utf8");
     expect(auditContent).toContain("unauthorized:caller_not_allowed");
   });
+
+  it("case 6: device-hub caller + 无 handle + self_hosted query → 200 DONE（M3 阶段2 走向B）", async () => {
+    const db = createTestDb();
+    await seedTrack(db, base);
+    const policyStore = createPolicyStore(db);
+    const auditSink = createAuditSink(auditPath);
+    const app = await buildServer({
+      db,
+      policyStore,
+      auditSink,
+      actor: "anonymous-service",
+    });
+
+    const r = await app.inject({
+      method: "POST",
+      url: "/content_query",
+      headers: {
+        "x-caller-identity": "device-hub",
+        "x-trace-id": "trace-case-6",
+      },
+      payload: { query: { keywords: ["Sunrise"] } },
+    });
+
+    expect(r.statusCode).toBe(200);
+    const body = r.json();
+    expect(body.kind).toBe("content_query");
+    expect(body.backend_type).toBe("self_hosted");
+    expect(body.completion_state).toBe("DONE");
+    // device-hub self_hosted 无 handle → receiveAndAuthorize !handle 短路 authorized
+    // → authorizeBackendType(device-hub, self_hosted) → authorized → queryBusiness
+  });
 });

@@ -7,7 +7,13 @@ export type AgentOSContentContract = {
   backend_type: "platform_backend" | "third_party_api" | "self_hosted";
   capability_mode: "real" | "mock" | "unavailable" | "degraded";
   completion_state: "DONE" | "DONE_WITH_CONCERNS" | "BLOCKED" | "NEEDS_CONTEXT";
-  error_code?: "NO_RESULT" | "AUTH_FAILED" | "REGION_RESTRICTED" | "COPYRIGHT_RESTRICTED" | "BACKEND_UNAVAILABLE";
+  error_code?:
+    | "NO_RESULT"
+    | "AUTH_FAILED"
+    | "REGION_RESTRICTED"
+    | "COPYRIGHT_RESTRICTED"
+    | "BACKEND_UNAVAILABLE"
+    | "CAPABILITY_UNSUPPORTED";
   query?: Query;
   candidates?: Candidate[];
   match?: Match;

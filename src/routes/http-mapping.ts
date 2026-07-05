@@ -7,7 +7,7 @@
 // 含 AUTH_FAILED/REGION_RESTRICTED）。envelope.ts TS ErrorCode 已在 T6 Step 1 扩对齐 schema；
 // 本签名用 string 兼容（http-mapping 不绑 envelope.ts 类型，只做字符串→状态码映射）。
 
-const CLIENT_BLOCK = new Set(["COPYRIGHT_RESTRICTED", "REGION_RESTRICTED"]);
+const CLIENT_BLOCK = new Set(["COPYRIGHT_RESTRICTED", "REGION_RESTRICTED", "CAPABILITY_UNSUPPORTED"]);
 
 export function httpStatus(completionState: string, errorCode?: string): number {
   if (completionState === "DONE" || completionState === "DONE_WITH_CONCERNS") return 200;
