@@ -21,6 +21,7 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, unlinkSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { seedSelfHostedCatalog } from "../../src/db/seed/seed.js";
+import { verifyChain } from "../../src/audit/audit-sink.js";
 import { createPolicyStore, type PolicyEnvelope } from "../../src/policy/policy-store.js";
 import type { ContentDb } from "../../src/content/db.js";
 
@@ -205,13 +206,8 @@ describe("M3 阶段2 e2e (device-hub 直连 + self_hosted 真实曲目)", { skip
     // 注意：drmGuard tool_call audit actor=ctx.actor（buildServer actor 默认 "anonymous-service"）
     // device-hub caller 不直接进 audit actor（actor 是 buildServer opts.actor）。audit 记 tool_call eventType。
     expect(audit).toContain('"eventType":"tool_call"');
-    // hash chain：每行有 hash 字段（audit-sink verifyChain）
-    const lines = audit.trim().split("\n");
-    expect(lines.length).toBeGreaterThan(0);
-    for (const l of lines) {
-      const e = JSON.parse(l);
-      expect(e.hash).toBeDefined(); // hash chain 每行有 hash
-    }
+    // review fold I2: 调 verifyChain 验证 hash chain 完整性（对齐 policy-push/kind-drm-audit e2e 范式）
+    expect(verifyChain(auditPath)).toBe(true);
   });
 
   it("#8 review fold P2#6: device-hub + track_id=qq:xxx 前缀驱动 third_party → 403", async () => {

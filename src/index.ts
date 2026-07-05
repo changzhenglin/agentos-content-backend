@@ -405,7 +405,8 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
       requestRegion,
     );
     // T2 P2#4: degraded 覆盖 envelope（capability-filter 算出 degraded，streamBusiness 不感知）
-    if (capDec.degraded && !capDec.blocked) {
+    // review fold I1: 仅成功路径（DONE）才标降级，避免掩盖 drm block / no_result / unavailable
+    if (capDec.degraded && !capDec.blocked && (envelope as any).completion_state === "DONE") {
       (envelope as any).capability_mode = "degraded";
       (envelope as any).completion_state = "DONE_WITH_CONCERNS";
     }
