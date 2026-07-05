@@ -26,7 +26,8 @@ export type ErrorCode =
   | "COPYRIGHT_RESTRICTED"
   | "REGION_RESTRICTED"
   | "BACKEND_UNAVAILABLE"
-  | "AUTH_FAILED";
+  | "AUTH_FAILED"
+  | "CAPABILITY_UNSUPPORTED";
 
 export interface Envelope {
   kind: Kind;
