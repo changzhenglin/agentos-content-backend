@@ -96,11 +96,12 @@ openclaw agent → cloud-ext content-adapter/music-query-tool (caller=cloud-ext,
 - 窗口C spec **提议契约**，schema 落地归窗口A（AgentOS 主仓 shared-protocols）；sibling repo 侧加消费校验
 - 不做：窗口C 不改 AgentOS 主仓 shared-protocols schema（归窗口A）
 
-### U6. cloud-ext（阶段2 不改）
+### U6. cloud-ext（阶段2 仅 schema sync，无代码改动）
 
 - content-adapter 5 kind 透传接口已 done（M2c Task 4）；music-query-tool query/match 已 done
 - 链路4 agent 入口接线 + stream/lyrics/metadata tool defer 阶段3（ASR/agent 决策一起做）
-- 阶段2 cloud-ext 零改动
+- 阶段2 cloud-ext **无代码改动**，但 schema sync 改了 `schemas/content-contract.schema.json`（error_code 加 CAPABILITY_UNSUPPORTED，三 repo 字节级同步，cloud-ext PR#4）
+- cloud-ext schema sync 验证边界：drift test（content-backend `test/drift.test.ts` + cloud-ext `scripts/verify-content-contract-sync.ts`）三 repo sha 一致；cloud-ext 既有测试无回归（schema enum 加值向后兼容）
 
 ### U7. e2e（content-backend 侧）
 
@@ -129,7 +130,7 @@ device-hub 调 content-backend 5 kind API（`POST /content_<kind>`，端口 3001
 ```
 device-hub POST /content_<kind> (headers + body)
   → receiveAndAuthorize(caller=device-hub, source, backend_type=self_hosted)  // U1 白名单 + backend_type 限制
-  → capability-filter(X-Device-Capability, kind, capability_policy)  // U2 筛选
+  → capability-filter(X-Device-Capability, kind)  // U2 筛选（消费 device_capability，不查 capability_policy）
   → resolveProviderPath(policyStore) → backendType=self_hosted  // 既有
   → drm-guard(kind, track, region, drm_rules)  // 既有
   → <kind>Business  // 差异点
@@ -166,7 +167,7 @@ cloud-ext agent → content-adapter contentRequest → content-backend 5 kind（
 | third_party mock provider 4xx | 透传 | 4xx | 提取 `error_code` | 既有 M2c content-adapter 4xx 透传 |
 | audit IO 错 | 不篡改 errorCode | — | audit fire-and-forget | 既有 M2b |
 
-**fail-closed**：policyStore 故障 → drm-guard fail-closed `BACKEND_UNAVAILABLE`（M2b 既有）；capability_policy store 故障 → capability-filter fail-closed `BACKEND_UNAVAILABLE`（U2 沿用，不 silent allow）。
+**fail-closed**：policyStore 故障 → drm-guard fail-closed `BACKEND_UNAVAILABLE`（M2b 既有）；capability-filter 复用 policyStore 做 fail-closed 探测（仅当 device_capability 存在时），store 故障 → `BACKEND_UNAVAILABLE`（U2 沿用，不 silent allow）。注意：capability-filter **不查 capability_policy rule**（那个归端侧），只复用 policyStore 做存活探测。
 
 ## 5. 测试 + e2e 策略
 
@@ -178,7 +179,7 @@ cloud-ext agent → content-adapter contentRequest → content-backend 5 kind（
 
 ### 5.2 集成测试
 - 5 kind API + device-hub caller header + drm/audit/capability 链（扩 `route-authorize.e2e.test.ts` 加 device-hub caller case）
-- capability_policy push（ops 下发）→ 5 kind 受能力约束（block/降级/allow）
+- device_capability header（端侧随 request 传）→ 5 kind 受能力约束（block/降级/allow）。注意：capability_policy（ops 下发给端侧）不在 content-backend 侧消费（A3 fold 消歧）
 - self_hosted 真实曲目全链：query→match→stream→lyrics→metadata 闭环
 
 ### 5.3 e2e（窗口C 内容侧边界）
@@ -208,7 +209,7 @@ cloud-ext agent → content-adapter contentRequest → content-backend 5 kind（
 |---|---|---|
 | content_request envelope schema（device_capability 字段） | 窗口A（AgentOS shared-protocols） | U5 提议契约，窗口A 落地 |
 | device-hub caller principal + `^hub:` handle 形态 | 窗口A | U5 提议，窗口A 实现 device-hub 侧 |
-| capability_policy 下发 | 窗口B（ops-platform） | 窗口B 下发，content-backend 侧读（U2 消费） |
+| capability_policy 下发 | 窗口B（ops-platform） | 窗口B 下发给端侧（content-backend 不消费，A3 fold）；content-backend 消费 device_capability（端侧随 request 传） |
 | content_policy 归属重审（ops-config schema 移除 kind） | 窗口B + 主调度 | 本 spec 不处理（§6 defer） |
 | 跨窗口全链 e2e | 窗口A 主调度 | 窗口C 提供 content-backend docker + 契约 |
 

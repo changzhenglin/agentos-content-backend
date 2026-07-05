@@ -1184,24 +1184,37 @@ git commit -m "test(m3-stage2): e2e mock device-hub caller + self_hosted 真实�
 - P1 perf latestPolicy 两次——同 A2
 - P2 perf queryTracks ILIKE 全表扫——sim 小库可接受，生产 GIN/trigram 索引 defer
 
-### 降级记录（model-routing §3）
-- codex gpt-5.5 实际调用（model: gpt-5.5, provider: custom, token.longshine.com）但 stream disconnect（2 次重试均 5/5 reconnect 失败）
-- 替代 = fresh-context 同模型 subagent（独立上下文，**非跨厂商**——同模型 glm-5.2[1m] family）
-- 剩余风险：content-contract 公共 contract 强制子集的**跨厂商盲点未覆盖**（codex 独有 catch 缺失，如 M2c/M2d codex 曾 catch ESM/blast radius/Dockerfile）
-- codex 恢复（网络恢复）后可补跑 codex plan review
+### 降级记录（model-routing §3）— 已补跑闭环
+- plan-eng-review 阶段 codex gpt-5.5 实际调用但 stream disconnect（token.longshine.com 网络问题，2 次重试失败），降级 fresh-context 同模型 subagent 替代
+- **补跑闭环**：code-review 阶段 codex 成功（97195 tokens high，2C+8I）；plan review 阶段补跑 codex 成功（26323 tokens medium，8 plan-level findings）——跨厂商实际产出，闭环满足
+
+### codex plan review 补跑（26323 tokens medium，8 findings）
+plan-eng-review 阶段 codex stream disconnect 后，于 finishing 前补跑成功。8 plan-level findings：
+
+**FIX NOW（spec 内部不一致，2 项，全修）**：
+- #6 §5.2 line 181：A3 fold 没改全，§5.2 仍说 capability_policy push 影响 5 kind——与 §U2 矛盾 → 修 spec §5.2（device_capability header 驱动）
+- #8 §6 U6：cloud-ext "零改动"不准（schema sync 改了 cloud-ext schema）→ 修 spec U6 措辞（仅 schema sync 无代码改动 + 验证边界）
+
+**DEFER 文档化（跨窗口/sim 边界，6 项）**：
+- #1 §3.2 auth 顺序：receiveAndAuthorize 在 resolveProviderPath 前（不依赖 backend_type），authorizeBackendType 在后（依赖）——spec 措辞 gap，实现两阶段 auth 正确
+- #2 §U2 per-kind applicability：capability-filter 5 kind 共享但 format/bitrate 降级仅 stream（query/match/lyrics/metadata 只筛 kind）——spec 措辞像所有 kind format/bitrate，实现 per-kind
+- #3 §U3 降级 variants：tracks 表一行一 track 无 variants，但 sim 降级是标签（capDec.degraded）非真实转码——plan 注释"sim 不做真实转码"
+- #4 §3.3 stream URL 投递契约：device-hub 如何处理 presigned URL（转发/rewrite/proxy/redact/expiry）未定义——跨窗口 contract gap，defer 窗口A + 跨窗口协调
+- #5 §U5 migration rule：测试用 header contract，最终 envelope 字段——migration 路径 defer 窗口A schema 落地
+- #7 §3.4 third_party mock scope：阶段2 花 budget 在 third_party mock（link4 regression）——T6 #6 known hole 验证需要，可辩护
 
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
-| Codex Review | `/codex review` | Independent 2nd opinion | 1 | DEGRADED | stream disconnect, fresh-context subagent 替代（非跨厂商），6 findings fold |
+| Codex Review | `/codex review` | Independent 2nd opinion | 2 | CLEAR | plan review 补跑 8 findings（2 FIX NOW spec + 6 DEFER）+ code review 2C+8I（4 FIX NOW 修） |
 | Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR | 3 findings, 3 fold (A1/A3/C1) |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
 
-- **CODEX:** DEGRADED — codex gpt-5.5 stream disconnect（token.longshine.com 网络问题，2 次重试失败），fresh-context 同模型 subagent 替代，6 findings 全 fold（P1#2 sim known hole + P2#3/#4/#5/#6 + P3#8）；跨厂商盲点未覆盖，codex 恢复后补跑。
-- **CROSS-MODEL:** 不可用（codex 未产出结论，无跨模型对照）；fresh-context subagent 与主 session 同模型，非跨厂商。
-- **VERDICT:** ENG CLEARED — 3 findings 全 fold；fresh-context subagent 6 findings 全 fold（含 P1#2 sim known hole 记录 + remediation）；codex 跨厂商降级（网络，非 auth），替代审查已 fold，剩余风险记录。plan v2 ready for executing-plans。
+- **CODEX:** plan review 补跑成功（26323 tokens medium）8 findings 全 fold（2 spec 内部不一致 FIX NOW + 6 DEFER 文档化）；code review 成功（97195 tokens high）2C+8I 4 FIX NOW 修（I1 degraded 守卫/I2 verifyChain/I6 regen generated/I7 http-mapping 403）。
+- **CROSS-MODEL:** codex plan review 独有 #4 stream URL 投递契约 / #5 migration rule / #7 third_party scope / #8 cloud-ext 边界（fresh-context 未 catch）；codex code review 独有 I6 generated stale / I7 http-mapping 503（fresh-context 未 catch）——跨厂商盲点覆盖到位。
+- **VERDICT:** ENG + CODEX CLEARED — plan-eng 3 + fresh-context 6 + codex plan 8 + codex code 2C+8I = 29 findings 全 fold/defer；跨厂商实际产出（plan + code 两阶段）；spec 内部不一致已修。
 
 NO UNRESOLVED DECISIONS
