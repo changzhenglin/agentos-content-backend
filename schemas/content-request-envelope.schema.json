@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentos.dev/schemas/content-request-envelope.schema.json",
+  "title": "AgentOS Content Request Envelope",
+  "type": "object",
+  "required": ["kind", "version"],
+  "properties": {
+    "kind": {"type": "string", "enum": ["content_query", "content_match", "content_stream", "content_lyrics", "content_metadata"]},
+    "version": {"type": "integer", "minimum": 1},
+    "device_capability": {"$ref": "#/$defs/device_capability"},
+    "track_id": {"type": "string"},
+    "query": {"$ref": "https://agentos.dev/schemas/content-contract.schema.json#/$defs/query"}
+  },
+  "allOf": [
+    {"if": {"properties": {"kind": {"const": "content_stream"}}, "required": ["kind"]}, "then": {"required": ["track_id"]}},
+    {"if": {"properties": {"kind": {"const": "content_metadata"}}, "required": ["kind"]}, "then": {"required": ["track_id"]}},
+    {"if": {"properties": {"kind": {"const": "content_lyrics"}}, "required": ["kind"]}, "then": {"required": ["track_id"]}},
+    {"if": {"properties": {"kind": {"const": "content_query"}}, "required": ["kind"]}, "then": {"required": ["query"]}},
+    {"if": {"properties": {"kind": {"const": "content_match"}}, "required": ["kind"]}, "then": {"required": ["query"]}}
+  ],
+  "$defs": {
+    "device_capability": {
+      "type": "object",
+      "required": ["kinds", "formats", "maxBitrate"],
+      "properties": {
+        "kinds": {"type": "array", "items": {"type": "string"}},
+        "formats": {"type": "array", "items": {"type": "string"}},
+        "maxBitrate": {"type": "integer", "minimum": 64000},
+        "region": {"type": "string"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

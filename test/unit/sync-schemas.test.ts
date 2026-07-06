@@ -27,8 +27,8 @@ describe("sync-schemas", () => {
 
   it("skips when source missing (not fail)", () => {
     const r = syncSchemas(join(tmpSrc, "none"), tmpDst);
-    // FILES 数组含 3 文件，全部源缺失 → skipped.length === 3
-    expect(r.skipped.length).toBe(3);
+    // FILES 数组含 4 文件（含 content-request-envelope），全部源缺失 → skipped.length === 4
+    expect(r.skipped.length).toBe(4);
     expect(r.copied).toEqual([]);
   });
 
