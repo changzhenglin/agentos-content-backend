@@ -1,0 +1,64 @@
+# M3 阶段2 Task 8 e2e: content-backend + postgres + minio + seed
+# 用法：docker compose -f docker-compose.e2e.yml up -d --build
+# content-backend :3001（self:track1/track2 seed）。端侧 device-hub/le270/jl7018 连 :3001。
+# 端口避开 host 占用（host 已有 15432/25432 postgres）：e2e postgres 35432, minio 19000。
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: agentos_content
+      POSTGRES_USER: agentos
+      POSTGRES_PASSWORD: agentos
+    ports: ["35432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentos -d agentos_content"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: agentos
+      MINIO_ROOT_PASSWORD: agentos123
+    ports: ["19000:9000", "19001:9001"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  seed:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://agentos:agentos@postgres:5432/agentos_content
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY_ID: agentos
+      S3_SECRET_ACCESS_KEY: agentos123
+      S3_BUCKET: agentos-content-test
+      S3_REGION: us-east-1
+      AUDIO_DIR: test/fixtures/audio
+      MIGRATIONS_DIR: src/db/migrations
+    command: ["pnpm", "exec", "tsx", "scripts/e2e-init.ts"]
+    restart: "no"
+
+  content-backend:
+    build: .
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    environment:
+      PORT: 3001
+      DATABASE_URL: postgres://agentos:agentos@postgres:5432/agentos_content
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY_ID: agentos
+      S3_SECRET_ACCESS_KEY: agentos123
+      S3_BUCKET: agentos-content-test
+      S3_REGION: us-east-1
+    ports: ["3001:3001"]
