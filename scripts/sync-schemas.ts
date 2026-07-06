@@ -4,11 +4,13 @@ import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 
 // content-contract 的 track/runtime_mode $ref 是绝对 URL (https://agentos.dev/schemas/...)
-// 这里 sync 这 3 个 schema：content-contract 自身 + 其远程 $ref 引用的 track + runtime-mode
+// sync 这 4 个 schema：content-contract 自身 + 其远程 $ref 引用的 track + runtime-mode
+// + content-request-envelope（M3 阶段2 Task 9：端侧 content-request envelope，三 repo sync）
 const FILES = [
   "content-contract.schema.json",
   "track.schema.json",
   "runtime-mode.schema.json",
+  "content-request-envelope.schema.json",
 ];
 
 export interface SyncResult {
