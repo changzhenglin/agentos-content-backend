@@ -21,6 +21,12 @@ export interface Env {
   port: number;                     // M2d: backend HTTP listen 端口（CLI spawn 用，default 3001）
   stubSecretsPath: string;          // M2d: stub secret store fixture JSON 路径（spawn env 传，D9 e2e 用）
   providerBaseUrl: Record<string, string>; // M2d: provider→base url 映射（PROVIDER_BASE_URL_<PROVIDER> env 解析）
+  iamJwksUrl: string;            // #2: IAM JWKS base（如 http://iam:3000）
+  iamJwtIssuer: string;          // #2: JWT iss 校验（agentos-iam）
+  iamJwtAudience: string;        // #2: JWT aud 校验（content-backend）
+  opsLookupUrl: string;          // #2: ops base（如 http://ops:3000）
+  opsLookupToken: string;        // #2: service-auth x-service-token（与 ops OPS_LOOKUP_TOKEN 同值）
+  capabilityMode: string;        // #2: mock=sim stub region/entitlement/mTLS caller，诚实声明
 }
 
 /**
@@ -67,5 +73,28 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
     stubSecretsPath: overrides.stubSecretsPath ?? process.env.STUB_SECRETS_PATH ?? "",
     // M2d: provider base url map（PROVIDER_BASE_URL_<PROVIDER> env 解析）
     providerBaseUrl: overrides.providerBaseUrl ?? loadProviderBaseUrlEnv(),
+    // #2: token 校验 env（prod 必配项默认空串，assertProdEnv fail-fast）
+    iamJwksUrl: overrides.iamJwksUrl ?? process.env.IAM_JWKS_URL ?? "",
+    iamJwtIssuer: overrides.iamJwtIssuer ?? process.env.IAM_JWT_ISSUER ?? "agentos-iam",
+    iamJwtAudience: overrides.iamJwtAudience ?? process.env.IAM_JWT_AUDIENCE ?? "content-backend",
+    opsLookupUrl: overrides.opsLookupUrl ?? process.env.OPS_LOOKUP_URL ?? "",
+    opsLookupToken: overrides.opsLookupToken ?? process.env.OPS_LOOKUP_TOKEN ?? "",
+    capabilityMode: overrides.capabilityMode ?? process.env.CAPABILITY_MODE ?? "mock",
   };
+}
+
+/**
+ * #2: production fail-fast 校验。prod 必配项缺失则抛错。
+ * 本 T1 仅定义，T6 buildServer 内调用。
+ */
+export function assertProdEnv(env: Env): void {
+  if (process.env.NODE_ENV !== "production") return;
+  const missing: string[] = [];
+  if (!env.iamJwksUrl) missing.push("IAM_JWKS_URL");
+  if (!env.opsLookupUrl) missing.push("OPS_LOOKUP_URL");
+  if (!env.opsLookupToken) missing.push("OPS_LOOKUP_TOKEN");
+  if (missing.length) throw new Error(`prod env missing: ${missing.join(", ")}`);
+  if (env.capabilityMode !== "mock") {
+    console.warn("[env] CAPABILITY_MODE!=mock but region/entitlement real-check not implemented");
+  }
 }
