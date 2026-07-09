@@ -70,7 +70,15 @@ export function createOpsLookupClient(opts: {
       if (!res.ok) {
         throw new LookupError(503, `ops lookup HTTP ${res.status}`);
       }
-      const body = (await res.json()) as unknown;
+      let body: unknown;
+      try {
+        body = await res.json();
+      } catch (e) {
+        throw new LookupError(
+          503,
+          `ops lookup invalid response body: ${(e as Error).message}`,
+        );
+      }
       if (
         typeof body !== "object" ||
         body === null ||

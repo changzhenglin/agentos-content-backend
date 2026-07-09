@@ -46,6 +46,12 @@ beforeAll(async () => {
         res.setHeader("content-type", "application/json");
         res.end(JSON.stringify({ bound: "true" }));
       },
+      "d-9": () => {
+        // 200 + 非 JSON body（如反代 HTML 错误页带 200）→ res.json() 抛 → LookupError(503)
+        res.statusCode = 200;
+        res.setHeader("content-type", "text/plain");
+        res.end("not json");
+      },
     };
     const handler = routes[device_id];
     if (handler) {
@@ -92,6 +98,7 @@ describe("createOpsLookupClient", () => {
     expect(lastHeaders["x-service-token"]).toBe("tok-1");
     expect(lastHeaders["x-service-name"]).toBe("content-backend");
     expect(lastHeaders["x-trace-id"]).toBe("trace-1");
+    expect(lastHeaders["accept"]).toBe("application/json");
   });
 
   it("500 → LookupError(503)", async () => {
@@ -118,7 +125,7 @@ describe("createOpsLookupClient", () => {
 
   it("网络错 → LookupError(503)", async () => {
     // 指向未监听端口 → fetch 抛 → LookupError(503)
-    const client = makeClient("http://127.0.0.1:1");
+    const client = makeClient("http://127.0.0.1:65530");
     await expect(client.lookupDeviceBinding("u-1", "d-5")).rejects.toMatchObject({
       status: 503,
     });
@@ -128,6 +135,14 @@ describe("createOpsLookupClient", () => {
   it("shape 无效（bound 非 boolean）→ LookupError(503)", async () => {
     const client = makeClient();
     await expect(client.lookupDeviceBinding("u-1", "d-8")).rejects.toMatchObject({
+      status: 503,
+    });
+  });
+
+  // Fix-1：200 + 非 JSON body（res.json 抛）→ LookupError(503)
+  it("200 + 非 JSON body → LookupError(503)（res.json 兜底）", async () => {
+    const client = makeClient();
+    await expect(client.lookupDeviceBinding("u-1", "d-9")).rejects.toMatchObject({
       status: 503,
     });
   });
