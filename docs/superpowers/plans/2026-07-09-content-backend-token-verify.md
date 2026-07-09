@@ -1311,4 +1311,370 @@ git commit -m "test(content-backend): #2 三 service e2e（IAM+ops+content-backe
 - `createTokenVerifier`/`createOpsLookupClient`/`createTokenVerifyHook` 工厂签名跨 task 一致 ✅
 - `parseRequestEnvelope` 返 `ParsedRequestEnvelope { version, kind?, userToken, deviceId?, raw }`，T5 消费 `parsed.version`/`parsed.userToken`/`parsed.deviceId` 一致 ✅
 
-无问题，plan 就绪。
+无问题，plan 就绪（pre-fold 自检；fold 修正见下节，以 fold 为准）。
+
+---
+
+## REVIEW FOLD（2026-07-09，三路 plan-review 共识）
+
+三路 review：Eng（fresh-context glm-5.2）+ DevEx（fresh-context）+ Codex gpt-5.5 跨厂商（406430 tokens）。VERDICT 均 NEEDS_REVISION/FAIL。fold 15 findings（12 P1 + 3 P2）。**SDD 实现时各 task 以本 fold 修正为准，覆盖上文 task 正文代码块。** spec 同步加 D7（preHandler 顺序 sim 偏离）+ D8（错误响应 wrapEnvelope shape）。
+
+### Fold-1（T1，P1 C4/C6）：env 加 prod fail-fast + 默认值修正
+
+`loadEnv` 默认值 `iamJwksUrl`/`opsLookupUrl` 不可同指 `localhost:3000`（IAM/ops 非同服务）。改：
+
+```ts
+    iamJwksUrl: overrides.iamJwksUrl ?? process.env.IAM_JWKS_URL ?? "",  // 无默认，prod 必配
+    iamJwtIssuer: overrides.iamJwtIssuer ?? process.env.IAM_JWT_ISSUER ?? "agentos-iam",
+    iamJwtAudience: overrides.iamJwtAudience ?? process.env.IAM_JWT_AUDIENCE ?? "content-backend",
+    opsLookupUrl: overrides.opsLookupUrl ?? process.env.OPS_LOOKUP_URL ?? "",  // 无默认，prod 必配
+    opsLookupToken: overrides.opsLookupToken ?? process.env.OPS_LOOKUP_TOKEN ?? "",  // 无默认，prod 必配
+    capabilityMode: overrides.capabilityMode ?? process.env.CAPABILITY_MODE ?? "mock",
+```
+
+加 `assertProdEnv`（production fail-fast）：
+```ts
+export function assertProdEnv(env: Env): void {
+  if (process.env.NODE_ENV !== "production") return;
+  const missing: string[] = [];
+  if (!env.iamJwksUrl) missing.push("IAM_JWKS_URL");
+  if (!env.opsLookupUrl) missing.push("OPS_LOOKUP_URL");
+  if (!env.opsLookupToken) missing.push("OPS_LOOKUP_TOKEN");
+  if (missing.length) throw new Error(`prod env missing: ${missing.join(", ")}`);
+  if (env.capabilityMode !== "mock") {
+    // 非 mock 但 region/entitlement 真校验未实现——warn 提醒
+    console.warn("[env] CAPABILITY_MODE!=mock but region/entitlement real-check not implemented");
+  }
+}
+```
+`buildServer`（T6）内 `loadEnv` 后调 `assertProdEnv(env)`。sim/docker/测试 NODE_ENV 非 production 不触发。
+
+### Fold-2（T2，P1 Codex 独有 + M1）：Envelope version 不放宽 + user_token 缺失 400
+
+`Envelope` interface 保持 `version: 1`（响应类型，spec §3.4 维持 v1 出）。**不**加 `version?: 1|2`。入向 v2 由独立 `ParsedRequestEnvelope` 承载（已定义，不动 `Envelope`）。
+
+`parseRequestEnvelope` v2 缺 `user_token` 显式 throw（spec §4 失败表：v2 缺 user_token/device_id→400）：
+```ts
+  // v2
+  if (!("device_id" in b) || typeof b["device_id"] !== "string" || b["device_id"].length === 0) {
+    throw new Error("invalid envelope: v2 device_id required (non-empty string)");
+  }
+  if (!("user_token" in b)) {
+    throw new Error("invalid envelope: v2 user_token required (string|null)");
+  }
+  const ut = b["user_token"];
+  if (ut !== null && typeof ut !== "string") {
+    throw new Error("invalid envelope: v2 user_token must be string or null");
+  }
+```
+T2 测试补：
+```ts
+  it("v2 缺 user_token → throw（400）", () => {
+    expect(() => parseRequestEnvelope({ version: 2, kind: "x", request: {}, device_id: "d" }))
+      .toThrow(/user_token required/i);
+  });
+```
+
+### Fold-3（T3，P1 Eng C1 / Codex P1 / DevEx C8）：jose 错误类不存在 + catch 逻辑重写
+
+jose 5 **无** `JWKSSigningEndpointNotFound`（tsc 失败 + 运行时 TypeError）。jose 5 实际 errors：`JOSEError`/`JWKSNoMatchingKey`/`JWKSTimeout`/`JWKSInvalid`/`JWTClaimValidationFailed`/`JWTExpired`/`JOSEAlgNotAllowed`/`JWSSignatureVerificationFailed` 等。用 `code` 字段 switch（jose errors 有稳定 `code`）：
+
+```ts
+    } catch (e) {
+      if (e instanceof VerifyError) throw e;
+      const code = (e as { code?: string }).code ?? "";
+      // kid 精确路由失败 / 签名 / claim / alg / expired → 401
+      if (
+        code === "ERR_JWKS_NO_MATCHING_KEY" ||
+        code === "ERR_JWS_SIGNATURE_VERIFICATION_FAILED" ||
+        code === "ERR_JWT_CLAIM_VALIDATION_FAILED" ||
+        code === "ERR_JWT_EXPIRED" ||
+        code === "ERR_JOSE_ALG_NOT_ALLOWED" ||
+        code === "ERR_JWT_INVALID" ||
+        code === "ERR_JWS_INVALID"
+      ) {
+        throw new VerifyError(401, `invalid token: ${(e as Error).message}`);
+      }
+      // JWKS 不可达/超时/HTTP 5xx → 503
+      if (
+        code === "ERR_JWKS_TIMEOUT" ||
+        code === "ERR_JWKS_INVALID" ||
+        (e instanceof Error && /fetch|network|timeout|ECONNREFUSED|failed to fetch/i.test(e.message))
+      ) {
+        throw new VerifyError(503, `jwks unavailable: ${(e as Error).message}`);
+      }
+      // 兜底：未知 JOSEError → 401（保守，不泄露 503）
+      throw new VerifyError(401, `invalid token: ${(e as Error).message}`);
+    }
+```
+**jti/exp 缺失→401**（P2 Codex）：IAM token 必带 jti/exp，缺则拒：
+```ts
+        const jti = typeof payload.jti === "string" && payload.jti.length > 0 ? payload.jti : undefined;
+        const exp = typeof payload.exp === "number" && payload.exp > 0 ? payload.exp : undefined;
+        if (!jti || !exp) {
+          throw new VerifyError(401, "jwt missing required jti/exp claim");
+        }
+        return { end_user_id: sub, jti, exp };
+```
+
+### Fold-4（T3，P1 Eng I3 / Codex P1 / DevEx C10）：JWKS 缓存致 503 测试 flaky
+
+`createRemoteJWKSet` 成功 fetch 后 `cooldownDuration`（默认 30s）内不 re-fetch，模块级 `verifier` 跨测试缓存致 503 测试不稳定。改：
+1. `verifier` 移入 `beforeEach`（每测试新建，禁缓存跨测试）：
+```ts
+beforeEach(() => {
+  agent = new MockAgent(); orig = getGlobalDispatcher();
+  setGlobalDispatcher(agent); agent.disableNetConnect();
+  // 每个 test 新 verifier，避免 JWKS 跨测试缓存
+});
+// verifier 在各 it 内创建：const verifier = createTokenVerifier({ jwksUrl: "http://iam.test", ... });
+```
+2. 503 测试用**独立 host**（`http://iam-503.test`）避免与 200 intercept 叠加：
+```ts
+  it("JWKS 503 → VerifyError(503)", async () => {
+    const verifier503 = createTokenVerifier({ jwksUrl: "http://iam-503.test", issuer: "agentos-iam", audience: "content-backend" });
+    agent.get("http://iam-503.test").intercept({ path: "/.well-known/jwks.json", method: "GET" }).reply(503, "down");
+    const jwt = await signToken({ sub: "u", jti: "j" });
+    await expect(verifier503.verifyUserToken(jwt)).rejects.toMatchObject({ status: 503 });
+  });
+```
+
+### Fold-5（T3，P1 Codex 独有）：JWT 测试签发用 KeyLike 非裸 JWK
+
+`SignJWT.sign` 需 `KeyLike`/`CryptoKey`，裸 JWK 对象（`privJwk`）非合法 key。改用 `privateKey`（`generateKeyPairSync` 返回的 KeyObject）或 `importJWK`：
+```ts
+// beforeAll 保留 privJwk 用于 exportJWK 公钥；签发用原始 KeyObject
+let privKeyObject: any;  // crypto.KeyObject
+beforeAll(async () => {
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  privKeyObject = privateKey;  // 签发用
+  privJwk = await exportJWK(createPrivateKey(privateKey));
+  pubJwk = await exportJWK(createPublicKey(publicKey));
+  pubJwk.kid = KID; pubJwk.alg = "RS256"; pubJwk.use = "sig";
+});
+// signToken 内：.sign(privKeyObject)  // 非 privJwk
+```
+
+### Fold-6（T4，P1 Eng I5 / Codex P1 / DevEx）：header 断言 no-op 修正
+
+`expect(true).toBe(true)` 不保护 service-auth 契约。用 undici `intercept` 的 `headers` match（请求头不符则不匹配→reply 不触发→fetch 抛错→测试 fail）：
+```ts
+  it("请求带 x-service-token + x-service-name 头", async () => {
+    agent.get("http://ops.test").intercept({
+      path: /\/api\/internal\/bindings\?end_user_id=u-1&device_id=d-3/,
+      method: "GET",
+      headers: { "x-service-token": "tok-1", "x-service-name": "content-backend" },
+    }).reply(200, { bound: true }, { headers: { "content-type": "application/json" } });
+    const r = await client.lookupDeviceBinding("u-1", "d-3");
+    expect(r.bound).toBe(true);  // 头不对则 intercept 不匹配→fetch 抛→test fail
+  });
+```
+
+### Fold-7（T4，P2 Codex / C7 / M2）：ops lookup shape 校验 + 401/403 区分 + trace_id 下传
+
+非 2xx 全 503 会把 ops 返 401/403（bad service-auth）误判为"不可用"，掩盖配置错。shape 不校验致 `{bound:"true"}` 静默通过。trace_id 不下传致跨服务 trace 断链。改 `createOpsLookupClient`：
+
+```ts
+export function createOpsLookupClient(opts: {
+  baseUrl: string; serviceToken: string; serviceName: string;
+}): OpsLookupClient {
+  return {
+    async lookupDeviceBinding(end_user_id: string, device_id: string, traceId?: string): Promise<DeviceBinding> {
+      const url = new URL("/api/internal/bindings", opts.baseUrl);
+      url.searchParams.set("end_user_id", end_user_id);
+      url.searchParams.set("device_id", device_id);
+      const headers: Record<string, string> = {
+        "x-service-token": opts.serviceToken,
+        "x-service-name": opts.serviceName,
+        "accept": "application/json",
+      };
+      if (traceId) headers["x-trace-id"] = traceId;
+      let res: Response;
+      try {
+        res = await fetch(url, { method: "GET", headers });
+      } catch (e) {
+        throw new LookupError(503, `ops lookup network error: ${(e as Error).message}`);
+      }
+      // ops service-auth 失败（403）≠ 不可用——区分 log（仍 503 给调用方，但 status-tag 区分）
+      if (res.status === 401 || res.status === 403) {
+        console.warn(`[ops-lookup] service-auth failed (HTTP ${res.status}) — check OPS_LOOKUP_TOKEN`);
+        throw new LookupError(503, `ops lookup service-auth failed: HTTP ${res.status}`);
+      }
+      if (!res.ok) {
+        throw new LookupError(503, `ops lookup HTTP ${res.status}`);
+      }
+      const body = await res.json() as unknown;
+      if (typeof body !== "object" || body === null || typeof (body as any).bound !== "boolean") {
+        throw new LookupError(503, "ops lookup invalid response shape (bound not boolean)");
+      }
+      return body as DeviceBinding;
+    },
+  };
+}
+```
+`OpsLookupClient` 接口签名加 `traceId?: string`。T5 `token-verify-hook` 调 `lookupBinding.lookupDeviceBinding(end_user_id, deviceId, traceId)` 下传 trace_id。
+
+### Fold-8（T5，P1 DevEx C1 / Codex P1 / D8）：preHandler 错误响应 wrapEnvelope + log
+
+裸 `{error:'...'}` 被 onSend AJV 吞成 500。改用 `wrapEnvelope`（D8）。失败分支加 `req.log.warn`（C9）。需在 `envelope.ts` ErrorCode enum 扩 5 值（Fold-2 已不动 Envelope version；ErrorCode 扩展单独）：
+
+`envelope.ts` ErrorCode 扩展：
+```ts
+export type ErrorCode =
+  | "NO_RESULT" | "COPYRIGHT_RESTRICTED" | "REGION_RESTRICTED" | "BACKEND_UNAVAILABLE"
+  | "AUTH_FAILED" | "CAPABILITY_UNSUPPORTED"
+  // #2 token-verify 失败码（D8）
+  | "INVALID_TOKEN" | "DEVICE_NOT_BOUND" | "JWKS_UNAVAILABLE" | "LOOKUP_UNAVAILABLE" | "INVALID_ENVELOPE";
+```
+
+`token-verify-hook.ts` 失败分支改（示例 invalid_token，其余同理）：
+```ts
+    try {
+      verified = await verifyToken.verifyUserToken(parsed.userToken);
+    } catch (e) {
+      const status = (e as VE).status;
+      if (status === 503) {
+        req.log.warn({ err: e, traceId }, "token-verify: jwks unavailable");
+        emitAudit(auditSink, "^end_user:unknown", "token_verify:jwks_unavailable", traceId);
+        return reply.code(503).send(wrapEnvelope({}, "content_query", "self_hosted", "unavailable", "blocked", "JWKS_UNAVAILABLE"));
+      }
+      req.log.warn({ err: e, traceId }, "token-verify: invalid token");
+      emitAudit(auditSink, "^end_user:unknown", "token_verify:invalid_token", traceId);
+      return reply.code(401).send(wrapEnvelope({}, "content_query", "self_hosted", "unavailable", "blocked", "INVALID_TOKEN"));
+    }
+```
+注：preHandler 无 `kind` 上下文（kind 在 body 内，parsed.kind 可用）——用 `parsed.kind ?? "content_query"`。各失败码映射：
+- version 违例/缺字段 → 400 `INVALID_ENVELOPE`
+- JWT 无效 → 401 `INVALID_TOKEN`
+- JWKS 不可用 → 503 `JWKS_UNAVAILABLE`
+- lookup 不可用 → 503 `LOOKUP_UNAVAILABLE`
+- bound=false → 403 `DEVICE_NOT_BOUND`
+
+T5 测试断言改 `r.json().error_code`（非 `r.json().error`）+ statusCode 不变。
+
+### Fold-9（T6，P1 Eng C2/C3/I1/I2 / Codex P1）：buildServer async await + BuildServerOpts env + 模块级 env 迁移
+
+1. `BuildServerOpts` **追加** `env?: Partial<Env>`（非替换签名）：
+```ts
+export interface BuildServerOpts {
+  db?: ...; s3?: ...; bucket?: ...; presign?: ...; policyStore?: ...;
+  auditSink?: ...; actor?: ...; secretStore?: ...; providerBaseUrl?: ...;
+  env?: Partial<Env>;  // #2 新增（plan-review fold：追加非替换）
+}
+```
+2. 模块级 `const env = loadEnv()`（`src/index.ts:98`）**移入** `buildServer`：`const env = loadEnv(opts.env ?? {})`。CLI 入口（`src/index.ts:526`）独立 `const env = loadEnv()` 保留（CLI 不接 opts）。buildServer 内所有 `env.*` 引用读局部 env。
+3. 测试 `await` + 嵌套 env：
+```ts
+  it("v2 有效 token + bound → /content_query 200", async () => {
+    const app = await buildServer({
+      env: { iamJwksUrl: "http://iam.test", iamJwtIssuer: "agentos-iam", iamJwtAudience: "content-backend",
+             opsLookupUrl: "http://ops.test", opsLookupToken: "tok", capabilityMode: "mock" },
+      // ...其他必要 opts（db/presign/policyStore 现有测试 pattern）
+    });
+    const token = await signToken();
+    const r = await app.inject({ ... });
+    expect(r.statusCode).toBe(200);
+  });
+```
+4. T6 测试 import 修正（M4）：顶部 `import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest"`（删 placeholder `beforeAll... // vitest 需 import`）。
+
+### Fold-10（T6，P1 D7）：preHandler 顺序 sim 偏离声明
+
+T6 正文 Step 3 注"顺序合理"删除，改声明 sim 偏离（spec D7）：
+> 注：preHandler（token-verify）在 route handler 内 inline `receiveAndAuthorize` 之前执行——与 spec §2 理想 caller-first 相反。**sim 阶段接受偏离**（sim no-mTLS caller header 可伪造，caller-first 无真实安全；真序由 mTLS #6 enforced）。不重构现有 inline `receiveAndAuthorize`（surgical）。
+
+### Fold-11（T7，P1 Eng I7 / Codex P1 / DevEx C5）：docker 三 DB init 脚本
+
+postgres image 默认只建 `POSTGRES_DB=agentos_content`。加 init SQL 挂 `/docker-entrypoint-initdb.d/`：
+
+新建 `docker/init-multi-db.sql`：
+```sql
+CREATE DATABASE agentos_iam;
+CREATE DATABASE agentos_ops;
+```
+`docker-compose.e2e.yml` postgres service 加 volume：
+```yaml
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: agentos_content
+      POSTGRES_USER: agentos
+      POSTGRES_PASSWORD: agentos
+    volumes:
+      - ./docker/init-multi-db.sql:/docker-entrypoint-initdb.d/init-multi-db.sql:ro
+    ports: ["35432:5432"]
+    healthcheck: ...
+```
+iam/ops 各自 migrate 在其 service 启动时跑（sibling Dockerfile entrypoint 应含 migrate；若无，加 `command: ["sh","-c","pnpm exec tsx scripts/migrate.ts && pnpm start"]`）。
+
+### Fold-12（T7，P1 Eng I8 / Codex P1 / DevEx C5）：seed 用 psql 直插 + fixture 文件 + 场景2 解绑
+
+seed 脚本 ops 绑定 API 路径未知 + content-backend 持 service token 非 user JWT 无权调绑定 API。**主路径改 psql 直插 `end_user_device_groups` + `devices` 表**（ops internal lookup 是稳定契约，绑定写入走 DB seed）。seed 输出写 fixture 文件（非 stdout，避免 docker run stdout 污染 JSON.parse）。
+
+`scripts/e2e-token-verify-seed.ts`（重写）：
+```ts
+// 通过 psql 直接 seed ops DB（agentos_ops）的 devices + end_user_device_groups 表
+import { execSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
+
+async function main() {
+  const iamBase = process.env.IAM_JWKS_URL?.replace(/\/\.well-known.*$/, "") ?? "http://localhost:3003";
+  const pgHost = process.env.PG_HOST ?? "localhost";
+  const pgPort = process.env.PG_PORT ?? "35432";
+
+  // 1. IAM register + login 拿 token
+  await fetch(`${iamBase}/auth/register`, { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: "e2e@test.local", password: "Passw0rd!", display_name: "e2e" }) });
+  const loginRes = await fetch(`${iamBase}/auth/login`, { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: "e2e@test.local", password: "Passw0rd!" }) });
+  const { access_token } = await loginRes.json() as { access_token: string };
+  const [, payload] = access_token.split(".");
+  const endUserId = JSON.parse(Buffer.from(payload, "base64url").toString()).sub;
+  const deviceId = "dev-e2e-1";
+
+  // 2. psql 直插 ops DB（devices + end_user_device_groups）
+  //    需先查 ops schema 确认表名/列名（agentos-ops-platform web/lib/db schema）
+  //    假设 devices(id, lifecycleState) + end_user_device_groups(id, end_user_id, role, deleted_at)
+  const psql = (sql: string) => execSync(
+    `psql "postgres://agentos:agentos@${pgHost}:${pgPort}/agentos_ops" -c "${sql.replace(/"/g, '\\"')}"`,
+    { stdio: "inherit" }
+  );
+  psql(`INSERT INTO devices (id, lifecycleState) VALUES ('${deviceId}', 'active') ON CONFLICT DO NOTHING;`);
+  psql(`INSERT INTO end_user_device_groups (id, end_user_id, role, deleted_at) VALUES ('g-e2e-1', '${endUserId}', 'owner', NULL) ON CONFLICT DO NOTHING;`);
+
+  // 3. 写 fixture 文件（非 stdout）
+  writeFileSync("/tmp/e2e-seed.json", JSON.stringify({ token: access_token, endUserId, deviceId }));
+  console.log("seed done -> /tmp/e2e-seed.json");
+}
+main().catch((e) => { console.error(e); process.exit(1); });
+```
+注：实现时先 `psql ... \d end_user_device_groups` 查 ops 实际 schema（列名/约束），调整 INSERT。`devices` 表的 `lifecycleState` enum 值以 ops schema 为准。
+
+e2e 测试读 fixture：
+```ts
+beforeAll(async () => {
+  const seedOut = JSON.parse(readFileSync("/tmp/e2e-seed.json", "utf8"));
+  token = seedOut.token; endUserId = seedOut.endUserId; deviceId = seedOut.deviceId;
+});
+```
+场景 2（解绑后重放）用 psql DELETE：
+```ts
+  it("2. 解绑后重放 → 403 device_not_bound", async () => {
+    // psql 解绑（soft delete end_user_device_groups）
+    execSync(`psql "postgres://agentos:agentos@localhost:35432/agentos_ops" -c "UPDATE end_user_device_groups SET deleted_at = NOW() WHERE end_user_id = '${endUserId}' AND id = 'g-e2e-1';"`);
+    const r = await fetch(`${CB}/content_query`, { ... 同场景1 ... });
+    expect(r.status).toBe(403);
+  });
+```
+
+### Fold-13（P2 DevEx C7 / 已并入 Fold-7）：trace_id 下传 ops lookup — 见 Fold-7。
+
+### 三路 review 汇总
+
+| Reviewer | 路径 | findings | 独有 catch |
+|---|---|---|---|
+| Eng（glm-5.2 fresh-context） | plan-eng-review | 3C+8I+4M | C1 jose 错误类 / C2 buildServer async / C3 BuildServerOpts 签名 / I6 顺序 |
+| DevEx（fresh-context） | plan-devex-review | 1C+4I+5M | C1 onSend 吞 500 / C2 顺序 / C5 e2e 可跑性 |
+| Codex（gpt-5.5 跨厂商 406430 tokens） | /codex consult | 12P1+3P2 | JWT 裸 JWK 签发 / user_token 缺失 400 / jti-exp 缺失 / ops 401-403 误判 503 |
+
+**VERDICT**: 三路 NEEDS_REVISION→fold 15 findings 全落地，spec 加 D7+D8。NO UNRESOLVED DECISIONS（D7 preHandler 顺序老林确认 sim 偏离；D8 错误体 wrapEnvelope 三路共识）。GATE: PASS（fold 后可进 SDD）。

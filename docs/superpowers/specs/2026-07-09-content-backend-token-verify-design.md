@@ -85,6 +85,8 @@ device-hub/cloud-ext ──POST /content_{query|match|stream|lyrics|metadata}─
 
 **分层原则**：`receiveAndAuthorize`（transport 层：谁的服务身份能调）与 `token-verify-hook`（content 层：哪个终端用户+哪台设备）正交，各管一层，失败语义独立。
 
+**执行顺序 sim 偏离（D7，plan-review fold 三路共识）**：spec §2 图理想序为 caller-first（normalizeInboundCaller/receiveAndAuthorize → token-verify），但实现中 token-verify 挂为 fastify `preHandler`（handler 前跑），`receiveAndAuthorize` 仍在 route handler 内 inline（后跑），实际序为 token-verify → receiveAndAuthorize。**sim 阶段接受此偏离**：sim no-mTLS 下 `X-Caller-Identity` header 可伪造，caller-first 不带来真实安全（caller 白名单仅 sim 占位）；真实 caller 绑定由 mTLS #6 落地时 enforced 正序。本 spec 不重构现有 inline `receiveAndAuthorize`（surgical），仅在 mTLS #6 SDD 落地时补 caller-first preHandler 序。
+
 ## 3. 组件接口
 
 ### 3.1 `src/auth/jwt-verify.ts`
@@ -185,6 +187,8 @@ export const tokenVerifyHook: preHandlerHookHandler
 
 **顺序**：先 JWT(401) 再 lookup(403)——未持有有效 token 者不应能探测绑定关系。lookup 不可用(503) ≠ bound=false(403)。audit 全程 emit，401 时 actor=`^end_user:unknown`，已验 token 后 actor=`^end_user:<id>`。
 
+**错误响应体 shape（D8，plan-review fold）**：preHandler 失败响应**不可**用裸 `{error:'...'}`——现有 `src/index.ts` onSend hook 对所有响应跑 content-contract schema AJV validate，裸 JSON fail→throw→客户端收 500。preHandler 失败响应改用 `wrapEnvelope({}, kind, "self_hosted", "unavailable", "blocked", <error_code>)`（与现有 403 AUTH_FAILED 路径一致），HTTP status 仍 `reply.code()`。新增 `ErrorCode` enum 值：`INVALID_TOKEN`/`DEVICE_NOT_BOUND`/`JWKS_UNAVAILABLE`/`LOOKUP_UNAVAILABLE`/`INVALID_ENVELOPE`（`envelope.ts` ErrorCode 扩展，非 frozen schema）。
+
 ## 5. env 扩展（`src/env.ts`）
 
 新增（prod `assertEnv` fail-fast，sim/docker 有值）：
@@ -229,6 +233,8 @@ export const tokenVerifyHook: preHandlerHookHandler
 - **D4 模块组织 fastify preHandler + 独立模块**：`token-verify-hook` preHandler 共享 + `jwt-verify`/`ops-lookup` 独立模块（互不依赖，可独立单测），与 `receiveAndAuthorize` 分层（transport vs content）。方案 1。
 - **D5 自建 jwt-verify 不复用 ops 模块**：跨 repo 不复用 ops `web/lib/jwt-verify.ts`，content-backend 自建等价模块（jose + createRemoteJWKSet），避免跨 repo 运行时依赖。
 - **D6 失败语义 401/403/503 分段**：JWT 无效 401 / 绑定不存在 403 / 服务不可用 503；顺序先 JWT 后 lookup（防探测绑定）；audit `^end_user:<id>` / `^end_user:unknown`。
+- **D7 preHandler 顺序 sim 偏离**：token-verify preHandler 跑在 inline receiveAndAuthorize 前（与 §2 理想 caller-first 相反）；sim no-mTLS 下 caller header 可伪造，caller-first 无真实安全，真序由 mTLS #6 enforced。老林 2026-07-09 确认 sim 偏离（surgical，不重构现有 inline authz）。三路 plan-review（Eng I6 / DevEx C2 / Codex P1）共识。
+- **D8 错误响应 wrapEnvelope shape**：preHandler 失败响应用 wrapEnvelope（非裸 {error}），避免 onSend AJV 校验吞成 500；新增 ErrorCode 值 INVALID_TOKEN/DEVICE_NOT_BOUND/JWKS_UNAVAILABLE/LOOKUP_UNAVAILABLE/INVALID_ENVELOPE。三路 plan-review（DevEx C1 / Codex P1）共识。
 
 ## 8. not-architecture-impact 声明（AgentOS 架构文档同步门禁）
 
