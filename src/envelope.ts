@@ -27,7 +27,12 @@ export type ErrorCode =
   | "REGION_RESTRICTED"
   | "BACKEND_UNAVAILABLE"
   | "AUTH_FAILED"
-  | "CAPABILITY_UNSUPPORTED";
+  | "CAPABILITY_UNSUPPORTED"
+  | "INVALID_TOKEN"
+  | "DEVICE_NOT_BOUND"
+  | "JWKS_UNAVAILABLE"
+  | "LOOKUP_UNAVAILABLE"
+  | "INVALID_ENVELOPE";
 
 export interface Envelope {
   kind: Kind;
