@@ -181,6 +181,13 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
   // 守卫：iamJwksUrl 空时（sim/dev 无 IAM）不构造 verifier——createTokenVerifier 内
   // new URL(jwksUrl) 对空串抛 TypeError。sim 无 IAM 时 token-verify 关闭（v1/匿名请求不受影响，
   // 既有测试不设 iamJwksUrl 故不回归）；prod 由 assertProdEnv 强制 iamJwksUrl 非空。
+  // #2 T6 fix-2（Minor）：non-mock capabilityMode 下 iamJwksUrl 空 → silent bypass 加 warn，
+  // 提醒生产环境漏配 token-verify；capabilityMode=mock 时不 warn（sim 诚实声明）。
+  if (!env.iamJwksUrl && env.capabilityMode !== "mock") {
+    console.warn(
+      "[index] iamJwksUrl empty → token-verify disabled (non-mock capabilityMode)",
+    );
+  }
   let tokenVerifyHook: ReturnType<typeof createTokenVerifyHook> | undefined;
   if (env.iamJwksUrl) {
     const tokenVerifier = createTokenVerifier({
@@ -542,13 +549,38 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
   // ajv onSend validate（解 plan-eng I3，完整实现非注释）：
   // 对每个 string payload（JSON 序列化后）跑 content-contract schema validate，
   // fail 则 throw → fastify 转 500（响应契约违规不应返回给客户端）。
-  // #2 T6：非 2xx 响应跳过校验——token-verify preHandler 失败响应用 ErrorCode
-  // （INVALID_TOKEN/DEVICE_NOT_BOUND/JWKS_UNAVAILABLE/LOOKUP_UNAVAILABLE/INVALID_ENVELOPE）
-  // 未在 content-contract.schema.json enum（该 schema 源在 AgentOS shared-protocols，跨仓 frozen，
-  // 需架构 delta 方可扩；本 task 不触）。跳过非 2xx 保失败响应不被 AJV 转 500（②类必要支撑）。
-  // 成功响应（2xx DONE）仍强校验契约——业务字段缺失/shape 错仍 throw 500。
+  // #2 T6 fix-1（Important）：原 `statusCode < 400` 跳过范围过宽——既有错误码
+  // （AUTH_FAILED/COPYRIGHT_RESTRICTED/BACKEND_UNAVAILABLE 等本在 schema enum）的服务端
+  // 契约校验被一并弱化。收窄为：仅 5 新 ErrorCode
+  // （INVALID_TOKEN/DEVICE_NOT_BOUND/JWKS_UNAVAILABLE/LOOKUP_UNAVAILABLE/INVALID_ENVELOPE，
+  // 不在 schema enum，需架构 delta 方可扩，本 task 不触）的 ≥400 响应跳过，
+  // 避失败响应被 AJV 转 500；其余（含既有错误码 + 2xx）仍强校验契约。
+  const NEW_TOKEN_VERIFY_CODES = new Set([
+    "INVALID_TOKEN",
+    "DEVICE_NOT_BOUND",
+    "JWKS_UNAVAILABLE",
+    "LOOKUP_UNAVAILABLE",
+    "INVALID_ENVELOPE",
+  ]);
   app.addHook("onSend", async (_req, _reply, payload) => {
-    if (typeof payload === "string" && _reply.statusCode < 400) {
+    if (typeof payload !== "string") {
+      return payload;
+    }
+    let skip = false;
+    if (_reply.statusCode >= 400) {
+      try {
+        const body = JSON.parse(payload);
+        if (
+          typeof body?.error_code === "string" &&
+          NEW_TOKEN_VERIFY_CODES.has(body.error_code)
+        ) {
+          skip = true; // 5 新码不在 schema enum，跳过避 500
+        }
+      } catch {
+        // 非 JSON payload，不跳过，走正常 validate
+      }
+    }
+    if (!skip) {
       const body = JSON.parse(payload);
       if (!validate(body)) {
         throw new Error(
