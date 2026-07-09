@@ -19,7 +19,7 @@ import Fastify from "fastify";
 import Ajv from "ajv";
 import { Pool } from "pg";
 import { createS3 } from "./storage/s3-client.js";
-import { loadEnv } from "./env.js";
+import { loadEnv, assertProdEnv, type Env } from "./env.js";
 import { wrapEnvelope } from "./envelope.js";
 import { httpStatus } from "./routes/http-mapping.js";
 import { queryBusiness } from "./routes/query.js";
@@ -45,6 +45,9 @@ import { fetchThirdParty } from "./content/third-party-adapter.js";
 import { selectPath } from "./content/path-select.js";
 import { parseTrackId, type Provider } from "./content/track-id.js";
 import { createStubSecretStore, type SecretStore } from "./auth/secret-store-stub.js";
+import { createTokenVerifier } from "./auth/jwt-verify.js";
+import { createOpsLookupClient } from "./auth/ops-lookup.js";
+import { createTokenVerifyHook } from "./auth/token-verify-hook.js";
 
 // P1.1 inbound caller 白名单：HTTP inbound 仅接受 cloud-ext external caller。
 // content-backend principal 仅用于内部 fetchThirdParty→resolveHandle（不经 HTTP inbound），
@@ -93,9 +96,9 @@ export interface BuildServerOpts {
   secretStore?: SecretStore;
   /** M2d: mock provider endpoint map（provider→base url；真 provider 授权后换真 endpoint）。 */
   providerBaseUrl?: Record<string, string>;
+  /** #2: env overrides（测试注入 mock IAM/ops host；CLI 不传走 process.env）。 */
+  env?: Partial<Env>;
 }
-
-const env = loadEnv();
 
 /**
  * M2d: 从 STUB_SECRETS_PATH fixture JSON 加载 stub secrets（spawn env 传，D9 e2e 用）。
@@ -124,6 +127,11 @@ interface HandlerResult {
  * 不 listen（inject 不需 listen）；listen 由 CLI 入口调。
  */
 export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnType<typeof Fastify>> {
+  // #2: env 移入 buildServer（原模块顶层 const env = loadEnv() 迁此），opts.env 优先注入测试 mock。
+  // CLI 入口不传 opts，独立 loadEnv 取 port（见文件末尾 CLI 块）。
+  const env = loadEnv(opts.env ?? {});
+  assertProdEnv(env);
+
   const db: ContentDb =
     opts.db ??
     (() => {
@@ -162,6 +170,36 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
   // M2d: providerBaseUrl 默认从 env（PROVIDER_BASE_URL_<PROVIDER> 解析）；opts 优先（in-process e2e 用）。
   const providerBaseUrl: Record<string, string> = opts.providerBaseUrl ?? env.providerBaseUrl;
   const ctx: DrmCtx = { policyStore, auditSink, actor };
+
+  // #2 T6: wire token-verify preHandler（T5 createTokenVerifyHook + T3 verifier + T4 lookup）。
+  // SIM 偏离声明（spec D7 / Fold-10）：preHandler（token-verify，content 层终端用户校验）
+  // 在 route handler 内 inline receiveAndAuthorize（transport 层 caller×source 矩阵）之前执行——
+  // 与 spec §2 理想 caller-first 相反。sim 阶段接受偏离：capability_mode=mock 下无 mTLS，
+  // caller header 可伪造，caller-first 无真实安全意义；真序由 mTLS #6 enforced。
+  // 不重构现有 inline receiveAndAuthorize（surgical，②类必要支撑仅挂 preHandler）。
+  //
+  // 守卫：iamJwksUrl 空时（sim/dev 无 IAM）不构造 verifier——createTokenVerifier 内
+  // new URL(jwksUrl) 对空串抛 TypeError。sim 无 IAM 时 token-verify 关闭（v1/匿名请求不受影响，
+  // 既有测试不设 iamJwksUrl 故不回归）；prod 由 assertProdEnv 强制 iamJwksUrl 非空。
+  let tokenVerifyHook: ReturnType<typeof createTokenVerifyHook> | undefined;
+  if (env.iamJwksUrl) {
+    const tokenVerifier = createTokenVerifier({
+      jwksUrl: env.iamJwksUrl,
+      issuer: env.iamJwtIssuer,
+      audience: env.iamJwtAudience,
+    });
+    const opsLookupClient = createOpsLookupClient({
+      baseUrl: env.opsLookupUrl,
+      serviceToken: env.opsLookupToken,
+      serviceName: "content-backend",
+    });
+    tokenVerifyHook = createTokenVerifyHook({
+      verifyToken: tokenVerifier,
+      lookupBinding: opsLookupClient,
+      auditSink,
+      capabilityMode: env.capabilityMode,
+    });
+  }
 
   const app = Fastify();
 
@@ -267,7 +305,7 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     return { backendType: path.backendType, providerHandle };
   }
 
-  app.post("/content_query", async (req, reply) => {
+  app.post("/content_query", { preHandler: tokenVerifyHook }, async (req, reply) => {
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
     const caller = normalizeInboundCaller(req.headers["x-caller-identity"]);
@@ -312,7 +350,7 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     );
     reply.code(status).send(envelope);
   });
-  app.post("/content_match", async (req, reply) => {
+  app.post("/content_match", { preHandler: tokenVerifyHook }, async (req, reply) => {
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
     const caller = normalizeInboundCaller(req.headers["x-caller-identity"]);
@@ -356,7 +394,7 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     );
     reply.code(status).send(envelope);
   });
-  app.post("/content_stream", async (req, reply) => {
+  app.post("/content_stream", { preHandler: tokenVerifyHook }, async (req, reply) => {
     const tid = (req.body as any).track_id;
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
@@ -412,7 +450,7 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     }
     reply.code(status).send(envelope);
   });
-  app.post("/content_lyrics", async (req, reply) => {
+  app.post("/content_lyrics", { preHandler: tokenVerifyHook }, async (req, reply) => {
     const tid = (req.body as any).track_id;
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
@@ -456,7 +494,7 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     );
     reply.code(status).send(envelope);
   });
-  app.post("/content_metadata", async (req, reply) => {
+  app.post("/content_metadata", { preHandler: tokenVerifyHook }, async (req, reply) => {
     const tid = (req.body as any).track_id;
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
@@ -504,8 +542,13 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
   // ajv onSend validate（解 plan-eng I3，完整实现非注释）：
   // 对每个 string payload（JSON 序列化后）跑 content-contract schema validate，
   // fail 则 throw → fastify 转 500（响应契约违规不应返回给客户端）。
+  // #2 T6：非 2xx 响应跳过校验——token-verify preHandler 失败响应用 ErrorCode
+  // （INVALID_TOKEN/DEVICE_NOT_BOUND/JWKS_UNAVAILABLE/LOOKUP_UNAVAILABLE/INVALID_ENVELOPE）
+  // 未在 content-contract.schema.json enum（该 schema 源在 AgentOS shared-protocols，跨仓 frozen，
+  // 需架构 delta 方可扩；本 task 不触）。跳过非 2xx 保失败响应不被 AJV 转 500（②类必要支撑）。
+  // 成功响应（2xx DONE）仍强校验契约——业务字段缺失/shape 错仍 throw 500。
   app.addHook("onSend", async (_req, _reply, payload) => {
-    if (typeof payload === "string") {
+    if (typeof payload === "string" && _reply.statusCode < 400) {
       const body = JSON.parse(payload);
       if (!validate(body)) {
         throw new Error(
@@ -522,6 +565,8 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
 // CLI 入口：node --import tsx src/index.ts 或 tsx src/index.ts。
 // M2d: listen 端口从 env.port 读（PORT env，default 3001；D9 e2e spawn 传动态端口避免冲突）。
 if (import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+  // CLI 不接 opts，独立 loadEnv 取 port（buildServer 内 env 是局部的）。
+  const cliEnv = loadEnv();
   const app = await buildServer();
-  app.listen({ port: env.port, host: "0.0.0.0" });
+  app.listen({ port: cliEnv.port, host: "0.0.0.0" });
 }
