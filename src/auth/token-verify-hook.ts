@@ -70,6 +70,10 @@ export function createTokenVerifyHook(deps: {
         );
     }
 
+    // #2 final I3：失败响应的 wrapEnvelope kind 用 parsed.kind（透传入向 envelope 的 kind），
+    // 非固定 "content_query"。parse 失败分支（parsed 不存在）才用 "content_query" 兜底。
+    const kind = (parsed.kind as Kind | undefined) ?? "content_query";
+
     // 匿名短路：v1 或 v2 user_token=null
     if (parsed.version === 1 || parsed.userToken === null) {
       req.endUser = null;
@@ -90,7 +94,7 @@ export function createTokenVerifyHook(deps: {
           .send(
             wrapEnvelope(
               {},
-              "content_query",
+              kind,
               "self_hosted",
               "unavailable",
               "blocked",
@@ -105,7 +109,7 @@ export function createTokenVerifyHook(deps: {
         .send(
           wrapEnvelope(
             {},
-            "content_query",
+            kind,
             "self_hosted",
             "unavailable",
             "blocked",
@@ -138,7 +142,7 @@ export function createTokenVerifyHook(deps: {
         .send(
           wrapEnvelope(
             {},
-            "content_query",
+            kind,
             "self_hosted",
             "unavailable",
             "blocked",
@@ -162,7 +166,7 @@ export function createTokenVerifyHook(deps: {
         .send(
           wrapEnvelope(
             {},
-            "content_query",
+            kind,
             "self_hosted",
             "unavailable",
             "blocked",

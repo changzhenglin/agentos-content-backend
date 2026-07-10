@@ -15,7 +15,7 @@
 //     （db.ts 注释：生产由 T7 注入 pg Pool）。故 db 默认用 pg Pool 包成 ContentDb，
 //     不直接用 createDb 返回的 drizzle instance（业务函数不依赖 drizzle query builder）。
 
-import Fastify from "fastify";
+import Fastify, { type preHandlerHookHandler } from "fastify";
 import Ajv from "ajv";
 import { Pool } from "pg";
 import { createS3 } from "./storage/s3-client.js";
@@ -179,16 +179,16 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
   // 不重构现有 inline receiveAndAuthorize（surgical，②类必要支撑仅挂 preHandler）。
   //
   // 守卫：iamJwksUrl 空时（sim/dev 无 IAM）不构造 verifier——createTokenVerifier 内
-  // new URL(jwksUrl) 对空串抛 TypeError。sim 无 IAM 时 token-verify 关闭（v1/匿名请求不受影响，
-  // 既有测试不设 iamJwksUrl 故不回归）；prod 由 assertProdEnv 强制 iamJwksUrl 非空。
-  // #2 T6 fix-2（Minor）：non-mock capabilityMode 下 iamJwksUrl 空 → silent bypass 加 warn，
-  // 提醒生产环境漏配 token-verify；capabilityMode=mock 时不 warn（sim 诚实声明）。
-  if (!env.iamJwksUrl && env.capabilityMode !== "mock") {
-    console.warn(
-      "[index] iamJwksUrl empty → token-verify disabled (non-mock capabilityMode)",
-    );
-  }
-  let tokenVerifyHook: ReturnType<typeof createTokenVerifyHook> | undefined;
+  // new URL(jwksUrl) 对空串抛 TypeError。
+  //
+  // #2 final I1（Important，fail-closed + 类型契约修复）：
+  //  - non-mock capabilityMode + iamJwksUrl 空 → throw（启动即失败，消除 silent bypass：
+  //    原先 tokenVerifyHook=undefined → fastify 视为无 hook → v2 请求静默放行当匿名）。
+  //  - mock capabilityMode + iamJwksUrl 空 → no-op preHandler 设 req.endUser=null
+  //    （sim 诚实声明，类型契约成立：req.endUser 永远 null|object 非 undefined）。
+  //  - tokenVerifier/opsLookupClient 仅 iamJwksUrl 非空时构造（避 new URL("") TypeError）。
+  // 既有测试 mock+不设 iamJwksUrl → no-op → req.endUser=null → 既有 v1/匿名路径不变，不回归。
+  let tokenVerifyHook: preHandlerHookHandler;
   if (env.iamJwksUrl) {
     const tokenVerifier = createTokenVerifier({
       jwksUrl: env.iamJwksUrl,
@@ -206,6 +206,17 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
       auditSink,
       capabilityMode: env.capabilityMode,
     });
+  } else {
+    // non-mock + 空 → fail-closed（启动即抛，消除 silent bypass）
+    if (env.capabilityMode !== "mock") {
+      throw new Error(
+        "IAM_JWKS_URL required when CAPABILITY_MODE != 'mock' (token-verify cannot be disabled in non-mock mode)",
+      );
+    }
+    // mock + 空：no-op preHandler，设 req.endUser=null（类型契约：null|object 非 undefined）
+    tokenVerifyHook = async (req) => {
+      req.endUser = null;
+    };
   }
 
   const app = Fastify();
