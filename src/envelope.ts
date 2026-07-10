@@ -27,7 +27,12 @@ export type ErrorCode =
   | "REGION_RESTRICTED"
   | "BACKEND_UNAVAILABLE"
   | "AUTH_FAILED"
-  | "CAPABILITY_UNSUPPORTED";
+  | "CAPABILITY_UNSUPPORTED"
+  | "INVALID_TOKEN"
+  | "DEVICE_NOT_BOUND"
+  | "JWKS_UNAVAILABLE"
+  | "LOOKUP_UNAVAILABLE"
+  | "INVALID_ENVELOPE";
 
 export interface Envelope {
   kind: Kind;
@@ -84,6 +89,72 @@ function completionState(
  * errorCode 由 handler 透传自 selectPath（解 M2：handler 返回 capabilityMode + errorCode，
  * T7 路由层无需 re-derive）。
  */
+/**
+ * ParsedRequestEnvelope：入向 content_request envelope 解析结果（#2）。
+ * 按 version 路由：无 version→v1（匿名 self_hosted）；version=2→取 user_token(JWT|null)+device_id。
+ * 供 T5 token-verify-hook 消费。
+ *
+ * 注：出向 Envelope 维持 version:1（spec §3.4），本接口仅用于入向解析，
+ * 不污染响应类型（M1）。
+ */
+export interface ParsedRequestEnvelope {
+  version: 1 | 2;
+  kind?: string;
+  userToken: string | null;
+  deviceId?: string;
+  raw: unknown;
+}
+
+/**
+ * parseRequestEnvelope：入向 content_request envelope 解析（#2）。
+ * 按 version 路由：无 version→v1（匿名 self_hosted）；version=2→取 user_token(JWT|null)+device_id。
+ * user_token=null=匿名（self_hosted public / 第三方必填非空由业务层校验）。
+ * version 非 1/2 → throw（C13 兼容：version present 必须=2）。
+ * v2 缺 device_id → throw（schema required）。
+ * v2 缺 user_token → throw（Fold-2：user_token required，即使为 null 也须显式传）。
+ */
+export function parseRequestEnvelope(body: unknown): ParsedRequestEnvelope {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new Error("invalid envelope: body must be object");
+  }
+  const b = body as Record<string, unknown>;
+  const ver = b["version"];
+  if (ver === undefined) {
+    // v1：无 version（旧客户端/匿名 self_hosted）
+    return {
+      version: 1,
+      kind: b["kind"] as string | undefined,
+      userToken: null,
+      raw: body,
+    };
+  }
+  if (ver !== 2) {
+    throw new Error(`unsupported version: ${ver}（仅支持 1/2）`);
+  }
+  // v2
+  if (
+    !("device_id" in b) ||
+    typeof b["device_id"] !== "string" ||
+    (b["device_id"] as string).length === 0
+  ) {
+    throw new Error("invalid envelope: v2 device_id required (non-empty string)");
+  }
+  if (!("user_token" in b)) {
+    throw new Error("invalid envelope: v2 user_token required (string|null)");
+  }
+  const ut = b["user_token"];
+  if (ut !== null && typeof ut !== "string") {
+    throw new Error("invalid envelope: v2 user_token must be string or null");
+  }
+  return {
+    version: 2,
+    kind: b["kind"] as string | undefined,
+    userToken: ut,
+    deviceId: b["device_id"] as string,
+    raw: body,
+  };
+}
+
 export function wrapEnvelope(
   business: object,
   kind: Kind,
