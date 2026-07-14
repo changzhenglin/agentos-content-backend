@@ -66,11 +66,14 @@ function toTrack(r: Record<string, unknown>): TrackRow {
 
 /**
  * queryTracks：Postgres ILIKE 全文（简化：仅 keywords[0]，title OR artist）。
+ * intent=lyric → lyrics.text ILIKE join tracks（D10' 歌词搜，不改 contract）。
+ * 无 intent/其他 intent → title OR artist ILIKE（既有，向后兼容）。
  * spec §5.1 query → {candidates:[]}
  */
 export async function queryTracks(
   db: ContentDb,
   keywords: string[],
+  intent?: string,
 ): Promise<{ candidates: QueryCandidate[] }> {
   if (!keywords.length) {
     const { rows } = await db.query(
@@ -79,6 +82,17 @@ export async function queryTracks(
     return { candidates: rows as unknown as QueryCandidate[] };
   }
   const pat = `%${keywords[0]}%`;
+  // D10' lyrics ILIKE 扩：intent=lyric → lyrics.text ILIKE 找 track_id
+  // codex P1 fold: DISTINCT ON (t.track_id) 去重 lyrics 多行 join 致重复；
+  // ORDER BY 必含 DISTINCT ON 列（Postgres 要求）。
+  if (intent === "lyric") {
+    const { rows } = await db.query(
+      "SELECT DISTINCT ON (t.track_id) t.track_id, t.title, t.artist, t.album FROM tracks t JOIN lyrics l ON l.track_id = t.track_id WHERE l.text ILIKE $1 ORDER BY t.track_id, t.published_at DESC LIMIT 50",
+      [pat],
+    );
+    return { candidates: rows as unknown as QueryCandidate[] };
+  }
+  // 既有：title/artist ILIKE
   const { rows } = await db.query(
     "SELECT track_id, title, artist, album FROM tracks WHERE title ILIKE $1 OR artist ILIKE $1 ORDER BY published_at DESC LIMIT 50",
     [pat],

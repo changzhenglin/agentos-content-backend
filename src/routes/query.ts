@@ -24,7 +24,7 @@ export async function queryBusiness(
   query: QueryRequest,
   ctx?: DrmCtx,
 ) {
-  const result = await queryTracks(db, query.keywords);
+  const result = await queryTracks(db, query.keywords, query.intent);
   const outcome = result.candidates.length ? ("ok" as const) : ("no_result" as const);
   // business 回显 query（content-contract schema content_query 要求 envelope 含 query）
   // ok 路径 emit tool_call audit（fold codex P2：drm 由 index.ts handle() 中央 guard）
