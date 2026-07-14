@@ -97,3 +97,54 @@ describe("queryTracks lyrics ILIKE 扩（D10'）", () => {
     expect(r.candidates[0].track_id).toBe("self:t1");
   });
 });
+
+describe("ILIKE 通配符 escape（codex/opus Minor fold：escapeLikePattern + default \\ escape）", () => {
+  // pg-mem 不支持 ILIKE \ escape 语义（\% 不当字面 %），故用 fake ContentDb capture 验
+  // queryTracks 调用 escapeLikePattern + pat 含 escape；真实 ILIKE escape 语义 defer 生产 Postgres
+  //（KNOWN HOLE pg-mem limitation：生产 Postgres default ESCAPE '\' 解析 \% \_ \\ 为字面量）
+  function captureDb(): { db: ContentDb; captured: { sql: string; params: unknown[] }[] } {
+    const captured: { sql: string; params: unknown[] }[] = [];
+    return {
+      db: {
+        query: async (text: string, params?: unknown[]) => {
+          captured.push({ sql: text, params: params ?? [] });
+          return { rows: [] };
+        },
+      } as unknown as ContentDb,
+      captured,
+    };
+  }
+
+  it("title/artist 分支：keywords 含 % → pat escape（\\%）", async () => {
+    const { db, captured } = captureDb();
+    await queryTracks(db, ["50%"]);
+    expect(captured.length).toBe(1);
+    expect(captured[0].params[0]).toBe("%50\\%%");
+    expect(captured[0].sql).toContain("title ILIKE $1");
+  });
+
+  it("title/artist 分支：keywords 含 _ → pat escape（\\_）", async () => {
+    const { db, captured } = captureDb();
+    await queryTracks(db, ["a_b"]);
+    expect(captured[0].params[0]).toBe("%a\\_b%");
+  });
+
+  it("title/artist 分支：正常 keywords（无 %/_）pat 不含 escape（向后兼容）", async () => {
+    const { db, captured } = captureDb();
+    await queryTracks(db, ["晴天"]);
+    expect(captured[0].params[0]).toBe("%晴天%");
+  });
+
+  it("lyric 分支：keywords 含 % → pat escape（\\%）", async () => {
+    const { db, captured } = captureDb();
+    await queryTracks(db, ["50%"], "lyric");
+    expect(captured[0].params[0]).toBe("%50\\%%");
+    expect(captured[0].sql).toContain("l.text ILIKE $1");
+  });
+
+  it("反斜杠 escape：keywords 含 \\ → pat escape（\\\\）", async () => {
+    const { db, captured } = captureDb();
+    await queryTracks(db, ["a\\b"]);
+    expect(captured[0].params[0]).toBe("%a\\\\b%");
+  });
+});

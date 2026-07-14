@@ -65,6 +65,17 @@ function toTrack(r: Record<string, unknown>): TrackRow {
 }
 
 /**
+ * escape ILIKE 通配符（\ % _）→ 字面量，配合 Postgres ILIKE default escape（\，codex/opus Minor fold）。
+ * 防 keywords 含 %/_ 被当通配符扩大匹配范围（非 SQL 注入，已参数化 $1）。
+ * 用 default escape（\）而非显式 ESCAPE 子句：pg-mem 不支持 ESCAPE 语法，但 default \ escape
+ * pg-mem + 生产 Postgres 都支持（Postgres ILIKE default ESCAPE '\'）。
+ * 顺序：先 \ （→\\）再 %/ _，防 \ 被二次 escape。
+ */
+function escapeLikePattern(s: string): string {
+  return s.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+}
+
+/**
  * queryTracks：Postgres ILIKE 全文（简化：仅 keywords[0]，title OR artist）。
  * intent=lyric → lyrics.text ILIKE join tracks（D10' 歌词搜，不改 contract）。
  * 无 intent/其他 intent → title OR artist ILIKE（既有，向后兼容）。
@@ -81,10 +92,12 @@ export async function queryTracks(
     );
     return { candidates: rows as unknown as QueryCandidate[] };
   }
-  const pat = `%${keywords[0]}%`;
+  const pat = `%${escapeLikePattern(keywords[0])}%`;
   // D10' lyrics ILIKE 扩：intent=lyric → lyrics.text ILIKE 找 track_id
   // codex P1 fold: DISTINCT ON (t.track_id) 去重 lyrics 多行 join 致重复；
   // ORDER BY 必含 DISTINCT ON 列（Postgres 要求）。
+  // codex/opus Minor fold: escapeLikePattern escape 通配符（\ % _）+ Postgres ILIKE default escape（\），
+  // 防 keywords 含 %/_ 扩大匹配；pg-mem 不支持 ESCAPE 子句，用 default \ escape（生产 Postgres 同）
   if (intent === "lyric") {
     const { rows } = await db.query(
       "SELECT DISTINCT ON (t.track_id) t.track_id, t.title, t.artist, t.album FROM tracks t JOIN lyrics l ON l.track_id = t.track_id WHERE l.text ILIKE $1 ORDER BY t.track_id, t.published_at DESC LIMIT 50",
