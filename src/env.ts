@@ -26,7 +26,7 @@ export interface Env {
   iamJwtAudience: string;        // #2: JWT aud 校验（content-backend）
   opsLookupUrl: string;          // #2: ops base（如 http://ops:3000）
   opsLookupToken: string;        // #2: service-auth x-service-token（与 ops OPS_LOOKUP_TOKEN 同值）
-  capabilityMode: string;        // #2: mock=sim stub region/entitlement/mTLS caller，诚实声明
+  capabilityMode: string;        // CAPABILITY_MODE env = auth stub 开关（region/entitlement/mTLS passthrough），非响应 capability_mode provenance。三层语义见 docs/capability-semantics.md
 }
 
 /**
