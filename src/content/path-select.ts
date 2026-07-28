@@ -8,6 +8,7 @@ export type CapabilityKind =
   | "metadata";
 
 export type BackendType = "self_hosted" | "third_party_api";
+// runtime CapabilityMode 有意排除 mock：production 执行 floor。schema enum 保留 mock 供 sim 证据（docs/capability-semantics.md）
 export type CapabilityMode = "real" | "degraded" | "unavailable";
 export type ErrorCode = "COPYRIGHT_RESTRICTED" | "BACKEND_UNAVAILABLE";
 

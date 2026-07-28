@@ -175,7 +175,7 @@ export function createTokenVerifyHook(deps: {
         );
     }
 
-    // region/entitlement stub（capability_mode=mock 放行，defer 真校验）
+    // mock passthrough 只记 debug 日志，不把 "mock" 写入响应 capability_mode（docs/capability-semantics.md）
     if (capabilityMode === "mock") {
       req.log.debug(
         { endUserId: verified.end_user_id, deviceId: parsed.deviceId },
