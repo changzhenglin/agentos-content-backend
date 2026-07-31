@@ -120,6 +120,7 @@ export async function streamBusiness(
       kind: "content_stream",
       target: trackId,
       actor: ctx.actor,
+      traceId: ctx.traceId,
       streamId: result.business.stream_id,
     });
   }

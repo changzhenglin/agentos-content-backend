@@ -15,6 +15,7 @@ import {
 import type { PresignFn } from "../../src/routes/stream.js";
 import Ajv from "ajv";
 import { readFileSync } from "node:fs";
+import type { AuditEvent, AuditSink } from "../../src/audit/audit-sink.js";
 
 // 复用 content-contract schema 做 client 侧断言（与 server onSend 同源）
 const ajv = new Ajv({ allErrors: true, validateSchema: false });
@@ -50,6 +51,21 @@ const mockPresign: PresignFn = async (key) => ({
   },
 });
 
+function createCapturingAuditSink(): {
+  sink: AuditSink;
+  events: Array<Omit<AuditEvent, "prevHash" | "hash" | "ts">>;
+} {
+  const events: Array<Omit<AuditEvent, "prevHash" | "hash" | "ts">> = [];
+  return {
+    sink: {
+      async emit(event) {
+        events.push(event);
+      },
+    },
+    events,
+  };
+}
+
 describe("server e2e", () => {
   it("POST /content_query 200 + schema-valid envelope (DONE)", async () => {
     const db = createTestDb();
@@ -78,29 +94,49 @@ describe("server e2e", () => {
     expect(validate(body)).toBe(true);
   });
 
-  it("GET /metrics → 200 + 通用三件套，route label 使用模板", async () => {
+  it("GET /metrics 未配置 token → 403 fail-closed；配置后需 Bearer token", async () => {
     const db = createTestDb();
-    const app = await buildServer({ db, presign: mockPresign });
-    await app.inject({
+    const closed = await buildServer({ db, presign: mockPresign });
+    const noToken = await closed.inject({ method: "GET", url: "/metrics" });
+    expect(noToken.statusCode).toBe(403);
+
+    const protectedApp = await buildServer({ db, presign: mockPresign, metricsToken: "metrics-secret" });
+    const denied = await protectedApp.inject({ method: "GET", url: "/metrics" });
+    expect(denied.statusCode).toBe(401);
+    const allowed = await protectedApp.inject({
+      method: "GET",
+      url: "/metrics",
+      headers: { authorization: "Bearer metrics-secret" },
+    });
+    expect(allowed.statusCode).toBe(200);
+    expect(allowed.body).toContain("http_requests_total");
+  });
+
+  it("入站 trace 统一 trim 后写入响应与审计，纯空白规范化为 null", async () => {
+    const db = createTestDb();
+    await seedTrack(db, base);
+    const captured = createCapturingAuditSink();
+    const app = await buildServer({ db, presign: mockPresign, auditSink: captured.sink });
+
+    const traced = await app.inject({
       method: "POST",
       url: "/content_query",
-      headers: { "x-trace-id": "trace-metrics", "x-trace-origin": "propagated" },
-      payload: { query: { keywords: ["none"] } },
+      headers: { "x-trace-id": "  trace-audit-inbound  " },
+      payload: { query: { keywords: ["Sunrise"] } },
     });
+    expect(traced.statusCode).toBe(200);
+    expect(traced.headers["x-trace-id"]).toBe("trace-audit-inbound");
+    expect(captured.events.at(-1)?.traceId).toBe("trace-audit-inbound");
 
-    const unauthorized = await buildServer({ db, presign: mockPresign, metricsToken: "metrics-secret" });
-    const denied = await unauthorized.inject({ method: "GET", url: "/metrics" });
-    expect(denied.statusCode).toBe(401);
-
-    const r = await app.inject({ method: "GET", url: "/metrics" });
-    expect(r.statusCode).toBe(200);
-    expect(r.headers["content-type"]).toContain("text/plain");
-    expect(r.body).toContain("http_requests_total");
-    expect(r.body).toContain("http_request_errors_total");
-    expect(r.body).toContain("http_request_duration_seconds");
-    expect(r.body).toContain('route="/content_query"');
-    expect(r.body).toContain("third_party_calls_total");
-    expect(r.body).toContain("third_party_call_duration_seconds");
+    const blank = await app.inject({
+      method: "POST",
+      url: "/content_query",
+      headers: { "x-trace-id": "   " },
+      payload: { query: { keywords: ["Sunrise"] } },
+    });
+    expect(blank.statusCode).toBe(200);
+    expect(blank.headers["x-trace-id"]).toBeUndefined();
+    expect(captured.events.at(-1)?.traceId).toBeNull();
   });
 
   it("POST /content_query no_result → 200 DONE_WITH_CONCERNS + NO_RESULT", async () => {

@@ -8,7 +8,17 @@ import type { Kind } from "../envelope.js";
 
 export async function emitProvision(
   sink: AuditSink | undefined,
-  { ingestId, trackId, actor }: { ingestId: string; trackId: string; actor: string },
+  {
+    ingestId,
+    trackId,
+    actor,
+    traceId,
+  }: {
+    ingestId: string;
+    trackId: string;
+    actor: string;
+    traceId?: string | null;
+  },
 ) {
   if (!sink) return;
   await sink.emit({
@@ -16,13 +26,17 @@ export async function emitProvision(
     actorType: "human",
     actor,
     target: trackId,
-    traceId: null,
+    traceId: traceId ?? null,
   });
 }
 
 export async function emitRevoke(
   sink: AuditSink | undefined,
-  { trackId, actor }: { trackId: string; actor: string },
+  {
+    trackId,
+    actor,
+    traceId,
+  }: { trackId: string; actor: string; traceId?: string | null },
 ) {
   if (!sink) return;
   await sink.emit({
@@ -30,13 +44,23 @@ export async function emitRevoke(
     actorType: "human",
     actor,
     target: trackId,
-    traceId: null,
+    traceId: traceId ?? null,
   });
 }
 
 export async function emitConfigApply(
   sink: AuditSink | undefined,
-  { ruleId, version, actor }: { ruleId: string; version: number; actor: string },
+  {
+    ruleId,
+    version,
+    actor,
+    traceId,
+  }: {
+    ruleId: string;
+    version: number;
+    actor: string;
+    traceId?: string | null;
+  },
 ) {
   if (!sink) return;
   await sink.emit({
@@ -44,14 +68,26 @@ export async function emitConfigApply(
     actorType: "service",
     actor,
     target: ruleId,
-    traceId: null,
+    traceId: traceId ?? null,
     policyVersion: version,
   });
 }
 
 export async function emitToolCall(
   sink: AuditSink | undefined,
-  { kind, target, actor, streamId }: { kind: Kind; target: string; actor: string; streamId?: number },
+  {
+    kind,
+    target,
+    actor,
+    streamId,
+    traceId,
+  }: {
+    kind: Kind;
+    target: string;
+    actor: string;
+    streamId?: number;
+    traceId?: string | null;
+  },
 ) {
   if (!sink) return;
   await sink.emit({
@@ -59,7 +95,7 @@ export async function emitToolCall(
     actorType: "service",
     actor,
     target,
-    traceId: null,
+    traceId: traceId ?? null,
     streamId,
   });
 }

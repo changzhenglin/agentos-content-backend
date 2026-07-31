@@ -33,6 +33,7 @@ export async function queryBusiness(
       kind: "content_query",
       target: query.keywords.join(" "),
       actor: ctx.actor,
+      traceId: ctx.traceId,
     });
   }
   return {

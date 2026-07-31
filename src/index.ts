@@ -66,6 +66,11 @@ function normalizeInboundCaller(raw: unknown): string {
     : "anonymous";
 }
 
+export function normalizeInboundTrace(raw: string | undefined): string | null {
+  const traceId = raw?.trim();
+  return traceId ? traceId : null;
+}
+
 // ajv compile content-contract schema + 预加载外部 $ref（track / runtime-mode）。
 // $ref 指向 https://agentos.dev/schemas/*.schema.json，按 $id 注册（解 I3：完整实现非注释）。
 const contentSchema = JSON.parse(
@@ -272,9 +277,7 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
 
   app.addHook("onRequest", async (req) => {
     (req as any).metricsStartedAt = process.hrtime.bigint();
-    const traceId = typeof req.headers["x-trace-id"] === "string"
-      ? req.headers["x-trace-id"].trim() || null
-      : null;
+    const traceId = normalizeInboundTrace(req.headers["x-trace-id"] as string | undefined);
     const traceOrigin = typeof req.headers["x-trace-origin"] === "string"
       ? req.headers["x-trace-origin"]
       : null;
@@ -312,7 +315,11 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
 
   app.get("/metrics", async (req, reply) => {
     const metricsToken = opts.metricsToken ?? process.env.METRICS_TOKEN;
-    if (metricsToken && req.headers.authorization !== `Bearer ${metricsToken}`) {
+    if (!metricsToken) {
+      req.log.warn("METRICS_TOKEN 未配置，拒绝 /metrics 访问");
+      return reply.code(403).send("Forbidden");
+    }
+    if (req.headers.authorization !== `Bearer ${metricsToken}`) {
       return reply.code(401).send("Unauthorized");
     }
     reply.type(metrics.contentType);
@@ -333,8 +340,9 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     fn: () => Promise<HandlerResult>,
     trackId: string,
     requestRegion: string,
+    traceId: string | null,
   ): Promise<{ envelope: object; status: number }> {
-    const guard = await drmGuard(ctx, kind, trackId, requestRegion);
+    const guard = await drmGuard({ ...ctx, traceId }, kind, trackId, requestRegion);
     if (guard.blocked) {
       const envelope = wrapEnvelope(
         {},
@@ -425,9 +433,9 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
     const caller = normalizeInboundCaller(req.headers["x-caller-identity"]);
-    const traceId = (req.headers["x-trace-id"] as string) || undefined;
+    const traceId = normalizeInboundTrace(req.headers["x-trace-id"] as string | undefined);
     // M2d: receiveAndAuthorize 替换 emitSecretHandleAudit（caller×source 矩阵校验）
-    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
+    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId: traceId ?? undefined });
     if (!authz.authorized) {
       const envelope = wrapEnvelope({}, "content_query", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
       return reply.code(403).send(envelope);
@@ -459,7 +467,7 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
             store: secretStore,
             caller: "content-backend",
             providerBaseUrl: providerBaseUrl[provider] ?? "",
-            traceId,
+            traceId: traceId ?? undefined,
             traceOrigin:
               req.headers["x-trace-origin"] === "generated"
                 ? "generated"
@@ -471,9 +479,10 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
               thirdPartyCallDurationSeconds.observe({ provider }, durationSeconds);
             },
           }).then(toHandlerResult)
-        : queryBusiness(db, body.query, ctx),
+        : queryBusiness(db, body.query, { ...ctx, traceId }),
       "", // query 无 track_id，占位 ""（block policy 全 kind 全 track 命中；空集 allow）
       requestRegion,
+      traceId,
     );
     reply.code(status).send(envelope);
   });
@@ -481,8 +490,8 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
     const caller = normalizeInboundCaller(req.headers["x-caller-identity"]);
-    const traceId = (req.headers["x-trace-id"] as string) || undefined;
-    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
+    const traceId = normalizeInboundTrace(req.headers["x-trace-id"] as string | undefined);
+    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId: traceId ?? undefined });
     if (!authz.authorized) {
       const envelope = wrapEnvelope({}, "content_match", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
       return reply.code(403).send(envelope);
@@ -514,7 +523,7 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
             store: secretStore,
             caller: "content-backend",
             providerBaseUrl: providerBaseUrl[provider] ?? "",
-            traceId,
+            traceId: traceId ?? undefined,
             traceOrigin:
               req.headers["x-trace-origin"] === "generated"
                 ? "generated"
@@ -526,9 +535,10 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
               thirdPartyCallDurationSeconds.observe({ provider }, durationSeconds);
             },
           }).then(toHandlerResult)
-        : matchBusiness(db, body.match, ctx),
+        : matchBusiness(db, body.match, { ...ctx, traceId }),
       "", // match 无 track_id，占位 ""
       requestRegion,
+      traceId,
     );
     reply.code(status).send(envelope);
   });
@@ -537,8 +547,8 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
     const caller = normalizeInboundCaller(req.headers["x-caller-identity"]);
-    const traceId = (req.headers["x-trace-id"] as string) || undefined;
-    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
+    const traceId = normalizeInboundTrace(req.headers["x-trace-id"] as string | undefined);
+    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId: traceId ?? undefined });
     if (!authz.authorized) {
       const envelope = wrapEnvelope({}, "content_stream", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
       return reply.code(403).send(envelope);
@@ -575,7 +585,7 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
             store: secretStore,
             caller: "content-backend",
             providerBaseUrl: providerBaseUrl[provider] ?? "",
-            traceId,
+            traceId: traceId ?? undefined,
             traceOrigin:
               req.headers["x-trace-origin"] === "generated"
                 ? "generated"
@@ -587,9 +597,10 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
               thirdPartyCallDurationSeconds.observe({ provider }, durationSeconds);
             },
           }).then(toHandlerResult)
-        : streamBusiness(db, presign, tid, ctx),
+        : streamBusiness(db, presign, tid, { ...ctx, traceId }),
       tid,
       requestRegion,
+      traceId,
     );
     // T2 P2#4: degraded 覆盖 envelope（capability-filter 算出 degraded，streamBusiness 不感知）
     // review fold I1: 仅成功路径（DONE）才标降级，避免掩盖 drm block / no_result / unavailable
@@ -604,8 +615,8 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
     const caller = normalizeInboundCaller(req.headers["x-caller-identity"]);
-    const traceId = (req.headers["x-trace-id"] as string) || undefined;
-    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
+    const traceId = normalizeInboundTrace(req.headers["x-trace-id"] as string | undefined);
+    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId: traceId ?? undefined });
     if (!authz.authorized) {
       const envelope = wrapEnvelope({}, "content_lyrics", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
       return reply.code(403).send(envelope);
@@ -636,7 +647,7 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
             store: secretStore,
             caller: "content-backend",
             providerBaseUrl: providerBaseUrl[provider] ?? "",
-            traceId,
+            traceId: traceId ?? undefined,
             traceOrigin:
               req.headers["x-trace-origin"] === "generated"
                 ? "generated"
@@ -648,9 +659,10 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
               thirdPartyCallDurationSeconds.observe({ provider }, durationSeconds);
             },
           }).then(toHandlerResult)
-        : lyricsBusiness(db, tid, ctx),
+        : lyricsBusiness(db, tid, { ...ctx, traceId }),
       tid,
       requestRegion,
+      traceId,
     );
     reply.code(status).send(envelope);
   });
@@ -659,8 +671,8 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
     const caller = normalizeInboundCaller(req.headers["x-caller-identity"]);
-    const traceId = (req.headers["x-trace-id"] as string) || undefined;
-    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
+    const traceId = normalizeInboundTrace(req.headers["x-trace-id"] as string | undefined);
+    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId: traceId ?? undefined });
     if (!authz.authorized) {
       const envelope = wrapEnvelope({}, "content_metadata", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
       return reply.code(403).send(envelope);
@@ -691,7 +703,7 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
             store: secretStore,
             caller: "content-backend",
             providerBaseUrl: providerBaseUrl[provider] ?? "",
-            traceId,
+            traceId: traceId ?? undefined,
             traceOrigin:
               req.headers["x-trace-origin"] === "generated"
                 ? "generated"
@@ -703,9 +715,10 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
               thirdPartyCallDurationSeconds.observe({ provider }, durationSeconds);
             },
           }).then(toHandlerResult)
-        : metadataBusiness(db, tid, ctx),
+        : metadataBusiness(db, tid, { ...ctx, traceId }),
       tid,
       requestRegion,
+      traceId,
     );
     reply.code(status).send(envelope);
   });
@@ -727,9 +740,7 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     "INVALID_ENVELOPE",
   ]);
   app.addHook("onSend", async (_req, _reply, payload) => {
-    const traceId = typeof _req.headers["x-trace-id"] === "string"
-      ? _req.headers["x-trace-id"].trim()
-      : "";
+    const traceId = normalizeInboundTrace(_req.headers["x-trace-id"] as string | undefined);
     if (traceId) {
       _reply.header("X-Trace-Id", traceId);
     }

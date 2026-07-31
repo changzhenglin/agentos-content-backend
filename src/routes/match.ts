@@ -29,6 +29,7 @@ export async function matchBusiness(
       kind: "content_match",
       target: `${match.title}|${match.artist}`,
       actor: ctx.actor,
+      traceId: ctx.traceId,
     });
   }
   return {

@@ -9,4 +9,5 @@ export interface DrmCtx {
   auditSink?: AuditSink; // 可选：无 audit 时 drm 仍生效，仅无 audit emit
   actor: string;
   requestRegion?: string;
+  traceId?: string | null;
 }
