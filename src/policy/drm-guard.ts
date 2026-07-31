@@ -60,6 +60,7 @@ export async function drmGuard(
           kind,
           target: trackId,
           actor: ctx.actor,
+          traceId: ctx.traceId,
         });
       } catch (e) {
         console.warn(

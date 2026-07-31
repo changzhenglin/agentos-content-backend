@@ -23,6 +23,7 @@ export async function lyricsBusiness(
       kind: "content_lyrics",
       target: trackId,
       actor: ctx.actor,
+      traceId: ctx.traceId,
     });
   }
   return {

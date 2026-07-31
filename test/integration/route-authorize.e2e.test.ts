@@ -163,7 +163,7 @@ describe("route-authorize e2e (Task 6)", () => {
 
     // audit unauthorized：reason=source_not_allowed 进 traceId 语义
     const auditContent = readFileSync(auditPath, "utf8");
-    expect(auditContent).toContain("unauthorized:source_not_allowed");
+    expect(auditContent).toContain('"reason":"source_not_allowed"');
     expect(auditContent).toContain("secret_handle:^backend:foo");
   });
 
@@ -246,7 +246,7 @@ describe("route-authorize e2e (Task 6)", () => {
 
     // caller 被白名单归一化为 anonymous → 不在 ALLOW_MATRIX → caller_not_allowed
     const auditContent = readFileSync(auditPath, "utf8");
-    expect(auditContent).toContain("unauthorized:caller_not_allowed");
+    expect(auditContent).toContain('"reason":"caller_not_allowed"');
     expect(auditContent).toContain("secret_handle:^backend:foo");
   });
 
@@ -278,7 +278,7 @@ describe("route-authorize e2e (Task 6)", () => {
     expect(body.error_code).toBe("AUTH_FAILED");
 
     const auditContent = readFileSync(auditPath, "utf8");
-    expect(auditContent).toContain("unauthorized:caller_not_allowed");
+    expect(auditContent).toContain('"reason":"caller_not_allowed"');
   });
 
   it("case 6: device-hub caller + 无 handle + self_hosted query → 200 DONE（M3 阶段2 走向B）", async () => {

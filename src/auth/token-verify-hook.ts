@@ -33,7 +33,7 @@ function emitAudit(
       actorType: "service",
       actor,
       target: event,
-      traceId: traceId ?? "unknown",
+      traceId: traceId ?? null,
     })
     .catch((e) => console.warn("[token-verify-hook] audit emit failed (non-blocking):", e));
 }

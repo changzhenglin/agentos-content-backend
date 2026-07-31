@@ -77,12 +77,15 @@ describe("audit-sink", () => {
       caller: "ops-platform",
       reason: "audience_mismatch",
       target: "content_policy",
+      traceId: "trace-audit-inbound",
     });
     const lines = readFileSync(path, "utf8").trim().split("\n");
     const e = JSON.parse(lines[0]);
     expect(e.eventType).toBe("tool_call");
     expect(e.actor).toBe("ops-platform");
     expect(e.target).toBe("content_policy");
+    expect(e.traceId).toBe("trace-audit-inbound");
+    expect(e.reason).toBe("audience_mismatch");
   });
 
   it("actorType：human vs service", async () => {
@@ -101,6 +104,6 @@ describe("audit-sink", () => {
     await expect(emitRevoke(undefined as any, { trackId: "self:t1", actor: "admin" })).resolves.toBeUndefined();
     await expect(emitConfigApply(undefined as any, { ruleId: "r1", version: 1, actor: "ops-platform" })).resolves.toBeUndefined();
     await expect(emitToolCall(undefined as any, { kind: "content_stream", target: "self:t1", actor: "cloud-ext", streamId: 99 })).resolves.toBeUndefined();
-    await expect(emitUnauthorized(undefined as any, { caller: "ops-platform", reason: "audience_mismatch", target: "content_policy" })).resolves.toBeUndefined();
+    await expect(emitUnauthorized(undefined as any, { caller: "ops-platform", reason: "audience_mismatch", target: "content_policy", traceId: "trace-noop" })).resolves.toBeUndefined();
   });
 });

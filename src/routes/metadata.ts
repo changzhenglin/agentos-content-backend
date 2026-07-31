@@ -29,6 +29,7 @@ export async function metadataBusiness(
       kind: "content_metadata",
       target: trackId,
       actor: ctx.actor,
+      traceId: ctx.traceId,
     });
   }
   return {

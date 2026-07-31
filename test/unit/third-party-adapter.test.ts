@@ -87,6 +87,8 @@ describe("third-party-adapter", () => {
       store,
       caller: "content-backend",
       providerBaseUrl: BASE,
+      traceId: "trace-third-party",
+      traceOrigin: "propagated",
     });
     expect(r.backendType).toBe("third_party_api");
     expect(r.capabilityMode).toBe("real");
@@ -94,6 +96,8 @@ describe("third-party-adapter", () => {
     expect(r.business).toHaveProperty("query");
     expect(r.business).toHaveProperty("candidates");
     expect(mp.receivedAuths.qq).toBe("Bearer mock-qq-token");
+    expect(mp.receivedTraceIds.qq).toBe("trace-third-party");
+    expect(mp.receivedTraceOrigins.qq).toBe("propagated");
   });
 
   it("resolve ok + token_type=bearer → mock 收 Authorization: Bearer（非 query_param 路径）", async () => {

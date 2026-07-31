@@ -8,7 +8,8 @@ export interface AuditEvent {
   actorType: "human" | "service";
   actor: string;
   target: string;
-  traceId: string;
+  traceId: string | null;
+  reason?: string;
   streamId?: number;
   policyVersion?: number;
   prevHash: string;

@@ -6,13 +6,19 @@
 import type { AuditSink } from "./audit-sink.js";
 import type { Kind } from "../envelope.js";
 
-function traceId(): string {
-  return `trace_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
 export async function emitProvision(
   sink: AuditSink | undefined,
-  { ingestId, trackId, actor }: { ingestId: string; trackId: string; actor: string },
+  {
+    ingestId,
+    trackId,
+    actor,
+    traceId,
+  }: {
+    ingestId: string;
+    trackId: string;
+    actor: string;
+    traceId?: string | null;
+  },
 ) {
   if (!sink) return;
   await sink.emit({
@@ -20,13 +26,17 @@ export async function emitProvision(
     actorType: "human",
     actor,
     target: trackId,
-    traceId: traceId(),
+    traceId: traceId ?? null,
   });
 }
 
 export async function emitRevoke(
   sink: AuditSink | undefined,
-  { trackId, actor }: { trackId: string; actor: string },
+  {
+    trackId,
+    actor,
+    traceId,
+  }: { trackId: string; actor: string; traceId?: string | null },
 ) {
   if (!sink) return;
   await sink.emit({
@@ -34,13 +44,23 @@ export async function emitRevoke(
     actorType: "human",
     actor,
     target: trackId,
-    traceId: traceId(),
+    traceId: traceId ?? null,
   });
 }
 
 export async function emitConfigApply(
   sink: AuditSink | undefined,
-  { ruleId, version, actor }: { ruleId: string; version: number; actor: string },
+  {
+    ruleId,
+    version,
+    actor,
+    traceId,
+  }: {
+    ruleId: string;
+    version: number;
+    actor: string;
+    traceId?: string | null;
+  },
 ) {
   if (!sink) return;
   await sink.emit({
@@ -48,14 +68,26 @@ export async function emitConfigApply(
     actorType: "service",
     actor,
     target: ruleId,
-    traceId: traceId(),
+    traceId: traceId ?? null,
     policyVersion: version,
   });
 }
 
 export async function emitToolCall(
   sink: AuditSink | undefined,
-  { kind, target, actor, streamId }: { kind: Kind; target: string; actor: string; streamId?: number },
+  {
+    kind,
+    target,
+    actor,
+    streamId,
+    traceId,
+  }: {
+    kind: Kind;
+    target: string;
+    actor: string;
+    streamId?: number;
+    traceId?: string | null;
+  },
 ) {
   if (!sink) return;
   await sink.emit({
@@ -63,16 +95,21 @@ export async function emitToolCall(
     actorType: "service",
     actor,
     target,
-    traceId: traceId(),
+    traceId: traceId ?? null,
     streamId,
   });
 }
 
-// 403 拒绝审计：复用 tool_call event_type（不扩 enum），actor=caller，
-// target=被拒资源，reason 进 traceId 语义（`traceId() + "|unauthorized:" + reason`）。
+// 403 拒绝审计：复用 tool_call event_type（不扩 enum），actor=caller。
+// traceId 只使用入站值；缺失时保留 null，不补建、不写占位符。
 export async function emitUnauthorized(
   sink: AuditSink | undefined,
-  { caller, reason, target }: { caller: string; reason: string; target: string },
+  {
+    caller,
+    reason: _reason,
+    target,
+    traceId,
+  }: { caller: string; reason: string; target: string; traceId?: string | null },
 ) {
   if (!sink) return;
   await sink.emit({
@@ -80,6 +117,7 @@ export async function emitUnauthorized(
     actorType: "service",
     actor: caller,
     target,
-    traceId: `${traceId()}|unauthorized:${reason}`,
+    traceId: traceId ?? null,
+    reason: _reason,
   });
 }

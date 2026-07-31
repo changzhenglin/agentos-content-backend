@@ -48,6 +48,11 @@ import { createStubSecretStore, type SecretStore } from "./auth/secret-store-stu
 import { createTokenVerifier } from "./auth/jwt-verify.js";
 import { createOpsLookupClient } from "./auth/ops-lookup.js";
 import { createTokenVerifyHook } from "./auth/token-verify-hook.js";
+import {
+  Counter,
+  Histogram,
+  Registry,
+} from "prom-client";
 
 // P1.1 inbound caller 白名单：HTTP inbound 仅接受 cloud-ext external caller。
 // content-backend principal 仅用于内部 fetchThirdParty→resolveHandle（不经 HTTP inbound），
@@ -59,6 +64,11 @@ function normalizeInboundCaller(raw: unknown): string {
   return typeof raw === "string" && (INBOUND_ALLOWED_CALLERS as readonly string[]).includes(raw)
     ? raw
     : "anonymous";
+}
+
+export function normalizeInboundTrace(raw: string | undefined): string | null {
+  const traceId = raw?.trim();
+  return traceId ? traceId : null;
 }
 
 // ajv compile content-contract schema + 预加载外部 $ref（track / runtime-mode）。
@@ -90,6 +100,8 @@ export interface BuildServerOpts {
   policyStore?: PolicyStore;
   /** AuditSink 注入（可选）。无 audit 时 drm 仍生效，仅无 audit emit。 */
   auditSink?: AuditSink;
+  /** metrics 端点访问鉴权。配置后必须通过 Authorization: Bearer。 */
+  metricsToken?: string;
   /** 调用方 actor 标识，用于 audit。默认 "anonymous-service"。 */
   actor?: string;
   /** M2d: secret store（third_party resolve；默认 stub 空 map，真 store defer M3-pre SDD）。 */
@@ -219,7 +231,100 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     };
   }
 
-  const app = Fastify();
+  const metrics = new Registry();
+  const httpRequestsTotal = new Counter({
+    name: "http_requests_total",
+    help: "HTTP 请求总数",
+    labelNames: ["method", "route", "status"] as const,
+    registers: [metrics],
+  });
+  const httpRequestErrorsTotal = new Counter({
+    name: "http_request_errors_total",
+    help: "HTTP 5xx 请求总数",
+    labelNames: ["method", "route"] as const,
+    registers: [metrics],
+  });
+  const httpRequestDurationSeconds = new Histogram({
+    name: "http_request_duration_seconds",
+    help: "HTTP 请求延迟（秒）",
+    labelNames: ["method", "route"] as const,
+    registers: [metrics],
+  });
+  const thirdPartyCallsTotal = new Counter({
+    name: "third_party_calls_total",
+    help: "第三方调用总数",
+    labelNames: ["provider", "status"] as const,
+    registers: [metrics],
+  });
+  const thirdPartyCallDurationSeconds = new Histogram({
+    name: "third_party_call_duration_seconds",
+    help: "第三方调用延迟（秒）",
+    labelNames: ["provider"] as const,
+    registers: [metrics],
+  });
+
+  const app = Fastify({
+    logger: {
+      redact: [
+        "req.headers.authorization",
+        "req.headers.token",
+        "req.headers.api_key",
+        "req.headers.x-secret-handle",
+      ],
+    },
+    requestIdHeader: "x-trace-id",
+  });
+
+  app.addHook("onRequest", async (req) => {
+    (req as any).metricsStartedAt = process.hrtime.bigint();
+    const traceId = normalizeInboundTrace(req.headers["x-trace-id"] as string | undefined);
+    const traceOrigin = typeof req.headers["x-trace-origin"] === "string"
+      ? req.headers["x-trace-origin"]
+      : null;
+    req.log.info(
+      {
+        module: "content-backend",
+        trace_id: traceId,
+        trace_origin: traceOrigin,
+        device_id: null,
+      },
+      "请求开始",
+    );
+  });
+
+  app.addHook("onResponse", async (req, reply) => {
+    const route = req.routeOptions.url || "unmatched";
+    if (route === "/metrics") return;
+    const labels = {
+      method: req.method,
+      route,
+      status: String(reply.statusCode),
+    };
+    httpRequestsTotal.inc(labels);
+    if (reply.statusCode >= 500) {
+      httpRequestErrorsTotal.inc({ method: req.method, route });
+    }
+    const startedAt = (req as any).metricsStartedAt as bigint | undefined;
+    if (startedAt !== undefined) {
+      httpRequestDurationSeconds.observe(
+        { method: req.method, route },
+        Number(process.hrtime.bigint() - startedAt) / 1e9,
+      );
+    }
+  });
+
+  app.get("/metrics", async (req, reply) => {
+    const metricsToken = opts.metricsToken ?? process.env.METRICS_TOKEN;
+    if (!metricsToken) {
+      req.log.warn("METRICS_TOKEN 未配置，拒绝 /metrics 访问");
+      return reply.code(403).send("Forbidden");
+    }
+    if (req.headers.authorization !== `Bearer ${metricsToken}`) {
+      return reply.code(401).send("Unauthorized");
+    }
+    reply.type(metrics.contentType);
+    return metrics.metrics();
+  });
 
   // 路由层统一 handle：调 drmGuard 前置 → blocked 直接返 BLOCKED envelope 不调 business fn
   // （fold codex P2：中央 guard，5 business functions 不内联 drm 块）→
@@ -235,8 +340,9 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     fn: () => Promise<HandlerResult>,
     trackId: string,
     requestRegion: string,
+    traceId: string | null,
   ): Promise<{ envelope: object; status: number }> {
-    const guard = await drmGuard(ctx, kind, trackId, requestRegion);
+    const guard = await drmGuard({ ...ctx, traceId }, kind, trackId, requestRegion);
     if (guard.blocked) {
       const envelope = wrapEnvelope(
         {},
@@ -327,9 +433,9 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
     const caller = normalizeInboundCaller(req.headers["x-caller-identity"]);
-    const traceId = (req.headers["x-trace-id"] as string) || undefined;
+    const traceId = normalizeInboundTrace(req.headers["x-trace-id"] as string | undefined);
     // M2d: receiveAndAuthorize 替换 emitSecretHandleAudit（caller×source 矩阵校验）
-    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
+    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId: traceId ?? undefined });
     if (!authz.authorized) {
       const envelope = wrapEnvelope({}, "content_query", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
       return reply.code(403).send(envelope);
@@ -361,10 +467,22 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
             store: secretStore,
             caller: "content-backend",
             providerBaseUrl: providerBaseUrl[provider] ?? "",
+            traceId: traceId ?? undefined,
+            traceOrigin:
+              req.headers["x-trace-origin"] === "generated"
+                ? "generated"
+                : req.headers["x-trace-origin"] === "propagated"
+                  ? "propagated"
+                  : undefined,
+            observeCall: (providerStatus, durationSeconds) => {
+              thirdPartyCallsTotal.inc({ provider, status: providerStatus });
+              thirdPartyCallDurationSeconds.observe({ provider }, durationSeconds);
+            },
           }).then(toHandlerResult)
-        : queryBusiness(db, body.query, ctx),
+        : queryBusiness(db, body.query, { ...ctx, traceId }),
       "", // query 无 track_id，占位 ""（block policy 全 kind 全 track 命中；空集 allow）
       requestRegion,
+      traceId,
     );
     reply.code(status).send(envelope);
   });
@@ -372,8 +490,8 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
     const caller = normalizeInboundCaller(req.headers["x-caller-identity"]);
-    const traceId = (req.headers["x-trace-id"] as string) || undefined;
-    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
+    const traceId = normalizeInboundTrace(req.headers["x-trace-id"] as string | undefined);
+    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId: traceId ?? undefined });
     if (!authz.authorized) {
       const envelope = wrapEnvelope({}, "content_match", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
       return reply.code(403).send(envelope);
@@ -405,10 +523,22 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
             store: secretStore,
             caller: "content-backend",
             providerBaseUrl: providerBaseUrl[provider] ?? "",
+            traceId: traceId ?? undefined,
+            traceOrigin:
+              req.headers["x-trace-origin"] === "generated"
+                ? "generated"
+                : req.headers["x-trace-origin"] === "propagated"
+                  ? "propagated"
+                  : undefined,
+            observeCall: (providerStatus, durationSeconds) => {
+              thirdPartyCallsTotal.inc({ provider, status: providerStatus });
+              thirdPartyCallDurationSeconds.observe({ provider }, durationSeconds);
+            },
           }).then(toHandlerResult)
-        : matchBusiness(db, body.match, ctx),
+        : matchBusiness(db, body.match, { ...ctx, traceId }),
       "", // match 无 track_id，占位 ""
       requestRegion,
+      traceId,
     );
     reply.code(status).send(envelope);
   });
@@ -417,8 +547,8 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
     const caller = normalizeInboundCaller(req.headers["x-caller-identity"]);
-    const traceId = (req.headers["x-trace-id"] as string) || undefined;
-    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
+    const traceId = normalizeInboundTrace(req.headers["x-trace-id"] as string | undefined);
+    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId: traceId ?? undefined });
     if (!authz.authorized) {
       const envelope = wrapEnvelope({}, "content_stream", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
       return reply.code(403).send(envelope);
@@ -455,10 +585,22 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
             store: secretStore,
             caller: "content-backend",
             providerBaseUrl: providerBaseUrl[provider] ?? "",
+            traceId: traceId ?? undefined,
+            traceOrigin:
+              req.headers["x-trace-origin"] === "generated"
+                ? "generated"
+                : req.headers["x-trace-origin"] === "propagated"
+                  ? "propagated"
+                  : undefined,
+            observeCall: (providerStatus, durationSeconds) => {
+              thirdPartyCallsTotal.inc({ provider, status: providerStatus });
+              thirdPartyCallDurationSeconds.observe({ provider }, durationSeconds);
+            },
           }).then(toHandlerResult)
-        : streamBusiness(db, presign, tid, ctx),
+        : streamBusiness(db, presign, tid, { ...ctx, traceId }),
       tid,
       requestRegion,
+      traceId,
     );
     // T2 P2#4: degraded 覆盖 envelope（capability-filter 算出 degraded，streamBusiness 不感知）
     // review fold I1: 仅成功路径（DONE）才标降级，避免掩盖 drm block / no_result / unavailable
@@ -473,8 +615,8 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
     const caller = normalizeInboundCaller(req.headers["x-caller-identity"]);
-    const traceId = (req.headers["x-trace-id"] as string) || undefined;
-    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
+    const traceId = normalizeInboundTrace(req.headers["x-trace-id"] as string | undefined);
+    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId: traceId ?? undefined });
     if (!authz.authorized) {
       const envelope = wrapEnvelope({}, "content_lyrics", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
       return reply.code(403).send(envelope);
@@ -505,10 +647,22 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
             store: secretStore,
             caller: "content-backend",
             providerBaseUrl: providerBaseUrl[provider] ?? "",
+            traceId: traceId ?? undefined,
+            traceOrigin:
+              req.headers["x-trace-origin"] === "generated"
+                ? "generated"
+                : req.headers["x-trace-origin"] === "propagated"
+                  ? "propagated"
+                  : undefined,
+            observeCall: (providerStatus, durationSeconds) => {
+              thirdPartyCallsTotal.inc({ provider, status: providerStatus });
+              thirdPartyCallDurationSeconds.observe({ provider }, durationSeconds);
+            },
           }).then(toHandlerResult)
-        : lyricsBusiness(db, tid, ctx),
+        : lyricsBusiness(db, tid, { ...ctx, traceId }),
       tid,
       requestRegion,
+      traceId,
     );
     reply.code(status).send(envelope);
   });
@@ -517,8 +671,8 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     const requestRegion = (req.headers["x-region"] as string) || getRegion();
     const secretHandle = (req.headers["x-secret-handle"] as string) || undefined;
     const caller = normalizeInboundCaller(req.headers["x-caller-identity"]);
-    const traceId = (req.headers["x-trace-id"] as string) || undefined;
-    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId });
+    const traceId = normalizeInboundTrace(req.headers["x-trace-id"] as string | undefined);
+    const authz = await receiveAndAuthorize({ handle: secretHandle, caller, auditSink, traceId: traceId ?? undefined });
     if (!authz.authorized) {
       const envelope = wrapEnvelope({}, "content_metadata", "self_hosted", "unavailable", "blocked", "AUTH_FAILED");
       return reply.code(403).send(envelope);
@@ -549,10 +703,22 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
             store: secretStore,
             caller: "content-backend",
             providerBaseUrl: providerBaseUrl[provider] ?? "",
+            traceId: traceId ?? undefined,
+            traceOrigin:
+              req.headers["x-trace-origin"] === "generated"
+                ? "generated"
+                : req.headers["x-trace-origin"] === "propagated"
+                  ? "propagated"
+                  : undefined,
+            observeCall: (providerStatus, durationSeconds) => {
+              thirdPartyCallsTotal.inc({ provider, status: providerStatus });
+              thirdPartyCallDurationSeconds.observe({ provider }, durationSeconds);
+            },
           }).then(toHandlerResult)
-        : metadataBusiness(db, tid, ctx),
+        : metadataBusiness(db, tid, { ...ctx, traceId }),
       tid,
       requestRegion,
+      traceId,
     );
     reply.code(status).send(envelope);
   });
@@ -574,6 +740,13 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     "INVALID_ENVELOPE",
   ]);
   app.addHook("onSend", async (_req, _reply, payload) => {
+    const traceId = normalizeInboundTrace(_req.headers["x-trace-id"] as string | undefined);
+    if (traceId) {
+      _reply.header("X-Trace-Id", traceId);
+    }
+    if (_req.routeOptions.url === "/metrics") {
+      return payload;
+    }
     if (typeof payload !== "string") {
       return payload;
     }

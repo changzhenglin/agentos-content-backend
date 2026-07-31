@@ -279,7 +279,8 @@ describe("content_policy push e2e", () => {
     const lines = readFileSync(auditPath, "utf8").trim().split("\n");
     const last = JSON.parse(lines[lines.length - 1]);
     expect(last.actor).toBe("ops-platform");
-    expect(last.traceId).toContain("unauthorized:san_mismatch");
+    expect(last.traceId).toBeNull();
+    expect(last.reason).toBe("san_mismatch");
   });
 
   it("envelope 缺 security_context → 400 INVALID_ENVELOPE（T5 review fix #1）", async () => {

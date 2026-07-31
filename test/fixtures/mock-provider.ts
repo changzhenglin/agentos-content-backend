@@ -21,6 +21,8 @@ type MockProviderResponseData =
 export interface MockProviderHandle {
   // 记录每个 provider 收到的 Authorization header（供测试断言 creds 路由正确）
   receivedAuths: Record<string, string | undefined>;
+  receivedTraceIds: Record<string, string | undefined>;
+  receivedTraceOrigins: Record<string, string | undefined>;
 }
 
 // 为给定 provider→baseUrl 映射注册 mock 拦截。
@@ -32,6 +34,8 @@ export function setupMockProvider(
   providerBaseUrl: Record<string, string>,
 ): MockProviderHandle {
   const receivedAuths: Record<string, string | undefined> = {};
+  const receivedTraceIds: Record<string, string | undefined> = {};
+  const receivedTraceOrigins: Record<string, string | undefined> = {};
   for (const [provider, baseUrl] of Object.entries(providerBaseUrl)) {
     const pool = agent.get(baseUrl);
     pool
@@ -42,6 +46,8 @@ export function setupMockProvider(
         const headers = (req.headers ?? {}) as Record<string, string>;
         const auth = headers.authorization;
         receivedAuths[provider] = auth;
+        receivedTraceIds[provider] = headers["x-trace-id"];
+        receivedTraceOrigins[provider] = headers["x-trace-origin"];
         const token = auth?.replace(/^Bearer /, "");
         if (!token || token === "invalid") {
           return { statusCode: 401, data: { error_code: "AUTH_FAILED" } };
@@ -63,5 +69,5 @@ export function setupMockProvider(
         };
       });
   }
-  return { receivedAuths };
+  return { receivedAuths, receivedTraceIds, receivedTraceOrigins };
 }

@@ -33,6 +33,12 @@ export interface FetchThirdPartyOpts {
   caller: string;
   /** mock provider endpoint base url */
   providerBaseUrl: string;
+  /** 入站 trace，第三方 HTTP 尽力透传；缺失时不补建。 */
+  traceId?: string;
+  /** 入站 trace 来源，和 trace 一并透传。 */
+  traceOrigin?: "generated" | "propagated";
+  /** 调用结果观测回调（由 HTTP 层接入 prom-client）。 */
+  observeCall?: (status: string, durationSeconds: number) => void;
 }
 
 export interface ThirdPartyResult {
@@ -67,7 +73,17 @@ function blocked(errorCode: string): ThirdPartyResult {
 export async function fetchThirdParty(
   opts: FetchThirdPartyOpts,
 ): Promise<ThirdPartyResult> {
-  const { kind, providerHandle, provider, store, caller, providerBaseUrl } = opts;
+  const {
+    kind,
+    providerHandle,
+    provider,
+    store,
+    caller,
+    providerBaseUrl,
+    traceId,
+    traceOrigin,
+    observeCall,
+  } = opts;
 
   // providerHandle 缺失 → AUTH_FAILED（route 未在 content_policy auth_config 查得 token_ref）。
   if (!providerHandle) {
@@ -92,6 +108,10 @@ export async function fetchThirdParty(
   // 构造请求 URL + 凭证注入（token_type 真用，P2.5）。
   const subPath = KIND_PATH[kind] ?? kind.replace("content_", "");
   const headers: Record<string, string> = {};
+  if (traceId?.trim()) {
+    headers["x-trace-id"] = traceId.trim();
+    if (traceOrigin) headers["x-trace-origin"] = traceOrigin;
+  }
   // url 在 try 内构造（P2.2：invalid URL 抛 TypeError 须被 catch 映射 BACKEND_UNAVAILABLE）。
   let url: URL;
   try {
@@ -108,12 +128,15 @@ export async function fetchThirdParty(
     return blocked("AUTH_FAILED");
   }
 
+  const startedAt = process.hrtime.bigint();
   try {
     const resp = await fetch(url, {
       method: "GET",
       headers,
       signal: AbortSignal.timeout(5000),
     });
+    const durationSeconds = Number(process.hrtime.bigint() - startedAt) / 1e9;
+    observeCall?.(String(resp.status), durationSeconds);
     if (!resp.ok) {
       // P2.7 catch 分流精神（非 validateContract on provider body）：
       // 5xx → BACKEND_UNAVAILABLE；4xx → 提取 body.error_code（默认 AUTH_FAILED）。
@@ -134,6 +157,10 @@ export async function fetchThirdParty(
       business,
     };
   } catch {
+    observeCall?.(
+      "network_error",
+      Number(process.hrtime.bigint() - startedAt) / 1e9,
+    );
     // fetch 网络错 / 超时 → BACKEND_UNAVAILABLE。
     return blocked("BACKEND_UNAVAILABLE");
   }
