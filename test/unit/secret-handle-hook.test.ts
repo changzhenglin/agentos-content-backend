@@ -33,12 +33,12 @@ describe("secret-handle-hook", () => {
     expect(events).toHaveLength(0);
   });
 
-  it("traceId 缺省 → 用 fallback 占位（不阻塞 audit）", async () => {
+  it("traceId 缺省 → audit 保留 null，不生成或写 unknown 占位", async () => {
     const events: any[] = [];
     const auditSink: AuditSink = { emit: async (e) => { events.push(e); } };
     await emitSecretHandleAudit(auditSink, "^cloud:x", "cloud-ext-service", undefined);
     expect(events).toHaveLength(1);
-    expect(events[0].traceId).toMatch(/unknown|fallback/);
+    expect(events[0].traceId).toBeNull();
   });
 });
 
@@ -80,7 +80,7 @@ describe("receiveAndAuthorize", () => {
       actor: "cloud-ext",
       target: "secret_handle:^backend:foo",
     });
-    expect(events[0].traceId).toContain("unauthorized:source_not_allowed");
+    expect(events[0].traceId).toBe("t1");
   });
 
   it("anonymous + ^cloud:foo → authorized:false reason:caller_not_allowed + audit unauthorized", async () => {
@@ -99,7 +99,7 @@ describe("receiveAndAuthorize", () => {
       actor: "anonymous",
       target: "secret_handle:^cloud:foo",
     });
-    expect(events[0].traceId).toContain("unauthorized:caller_not_allowed");
+    expect(events[0].traceId).toBe("t1");
   });
 
   it("无 handle（self_hosted 路径）→ authorized true + 不 audit", async () => {

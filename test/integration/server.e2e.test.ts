@@ -58,6 +58,10 @@ describe("server e2e", () => {
     const r = await app.inject({
       method: "POST",
       url: "/content_query",
+      headers: {
+        "x-trace-id": "trace-server-e2e",
+        "x-trace-origin": "propagated",
+      },
       payload: { query: { keywords: ["Sunrise"] } },
     });
     expect(r.statusCode).toBe(200);
@@ -67,8 +71,36 @@ describe("server e2e", () => {
     expect(body.completion_state).toBe("DONE");
     expect(body.candidates).toBeInstanceOf(Array);
     expect(body.candidates[0].track_id).toBe("self:t1");
+    // trace 只能走响应 header，不得进入 frozen response body。
+    expect(r.headers["x-trace-id"]).toBe("trace-server-e2e");
+    expect(body).not.toHaveProperty("trace_id");
     // ajv onSend 已在 server 内 validate；此处 client 侧独立确认 schema-valid
     expect(validate(body)).toBe(true);
+  });
+
+  it("GET /metrics → 200 + 通用三件套，route label 使用模板", async () => {
+    const db = createTestDb();
+    const app = await buildServer({ db, presign: mockPresign });
+    await app.inject({
+      method: "POST",
+      url: "/content_query",
+      headers: { "x-trace-id": "trace-metrics", "x-trace-origin": "propagated" },
+      payload: { query: { keywords: ["none"] } },
+    });
+
+    const unauthorized = await buildServer({ db, presign: mockPresign, metricsToken: "metrics-secret" });
+    const denied = await unauthorized.inject({ method: "GET", url: "/metrics" });
+    expect(denied.statusCode).toBe(401);
+
+    const r = await app.inject({ method: "GET", url: "/metrics" });
+    expect(r.statusCode).toBe(200);
+    expect(r.headers["content-type"]).toContain("text/plain");
+    expect(r.body).toContain("http_requests_total");
+    expect(r.body).toContain("http_request_errors_total");
+    expect(r.body).toContain("http_request_duration_seconds");
+    expect(r.body).toContain('route="/content_query"');
+    expect(r.body).toContain("third_party_calls_total");
+    expect(r.body).toContain("third_party_call_duration_seconds");
   });
 
   it("POST /content_query no_result → 200 DONE_WITH_CONCERNS + NO_RESULT", async () => {

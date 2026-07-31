@@ -30,7 +30,7 @@ export async function emitSecretHandleAudit(
       actorType: "service",
       actor,
       target: `secret_handle:${handle}`,
-      traceId: traceId ?? "unknown",
+      traceId: traceId ?? null,
     });
   } catch (e) {
     console.warn("[secret-handle-hook] audit emit failed (non-blocking):", e);
@@ -86,6 +86,7 @@ export async function receiveAndAuthorize(opts: {
       caller,
       reason: "caller_not_allowed",
       target,
+      traceId,
     }).catch((e) =>
       console.warn("[secret-handle-hook] audit unauthorized emit failed:", e),
     );
@@ -99,6 +100,7 @@ export async function receiveAndAuthorize(opts: {
       caller,
       reason: "source_not_allowed",
       target,
+      traceId,
     }).catch((e) =>
       console.warn("[secret-handle-hook] audit unauthorized emit failed:", e),
     );
