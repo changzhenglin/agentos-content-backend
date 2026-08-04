@@ -26,6 +26,7 @@ const REVIEW_DDL = `CREATE TABLE review (
   ingest_id text NOT NULL,
   actor text NOT NULL,
   action text NOT NULL,
+  reason text,
   at timestamp NOT NULL DEFAULT now()
 )`;
 
@@ -191,5 +192,39 @@ describe("review state machine", () => {
     });
     await transition(db, "i1", "resubmit", "user:op");
     expect(await ingestState(db, "i1")).toBe("pending");
+  });
+
+  it("transition with reason records it on review row", async () => {
+    const db = setup();
+    await seedIngest(db, {
+      id: "i1",
+      trackId: "self:t1",
+      source: "self_hosted",
+      rawMetadata: META,
+      audioObjectKey: "obj/key",
+      state: "pending",
+    });
+    await transition(db, "i1", "reject", "user:admin", "license unclear");
+    const { rows } = await db.query(
+      "SELECT reason FROM review WHERE ingest_id = 'i1'",
+    );
+    expect(rows[0].reason).toBe("license unclear");
+  });
+
+  it("transition without reason stores NULL", async () => {
+    const db = setup();
+    await seedIngest(db, {
+      id: "i1",
+      trackId: "self:t1",
+      source: "self_hosted",
+      rawMetadata: META,
+      audioObjectKey: "obj/key",
+      state: "pending",
+    });
+    await transition(db, "i1", "approve", "user:admin");
+    const { rows } = await db.query(
+      "SELECT reason FROM review WHERE ingest_id = 'i1'",
+    );
+    expect(rows[0].reason).toBeNull();
   });
 });

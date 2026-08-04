@@ -56,10 +56,11 @@ export async function ingestTransitionAndAudit(
   ingestId: string,
   action: "approve" | "reject" | "revoke",
   actor: string,
+  reason?: string,
 ): Promise<{ trackId: string | null }> {
   // 先取 trackId 再 transition（target 非空，fold eng I1）
   const trackId = await fetchIngestTrackId(db, ingestId);
-  await transition(db, ingestId, action, actor);
+  await transition(db, ingestId, action, actor, reason);
   if (action === "approve" && trackId) {
     await emitProvision(auditSink, { ingestId, trackId, actor });
   }

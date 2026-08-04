@@ -57,6 +57,7 @@ export async function transition(
   ingestId: string,
   action: ReviewAction,
   actor: string,
+  reason?: string,
 ): Promise<void> {
   const i = await fetchIngest(db, ingestId);
   if (!i) throw new Error("NOT_FOUND");
@@ -67,8 +68,8 @@ export async function transition(
 
   const reviewId = `r${Date.now()}`;
   await db.query(
-    "INSERT INTO review (id, ingest_id, actor, action) VALUES ($1,$2,$3,$4)",
-    [reviewId, ingestId, actor, action],
+    "INSERT INTO review (id, ingest_id, actor, action, reason) VALUES ($1,$2,$3,$4,$5)",
+    [reviewId, ingestId, actor, action, reason ?? null],
   );
 
   if (action === "approve") {
