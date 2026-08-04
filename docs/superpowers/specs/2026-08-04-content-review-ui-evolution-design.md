@@ -55,7 +55,7 @@
    - 试听区（§3.2）
    - 审核历史区：该 ingest 的 review 表记录（时间/actor/action/reason）
    - 操作按钮区：按当前状态显隐——pending 显示 approve/reject；approved 显示 revoke；rejected/revoked 只显示状态说明。reject/revoke 附可选理由输入框（§3.4）
-3. **已发布曲目页**（`GET /admin/tracks` 现状保持，仅套统一布局导航）
+3. **已发布曲目页**（`GET /admin/tracks`）：套统一布局导航。**移除 M2b 遗留的 10s htmx 自刷新**（fold codex P1-1：原实现整页响应 swap 进 div 有嵌套/重复 ID bug；审核场景手动刷新足够，YAGNI）。
 
 操作提交走既有 transition 路由（htmx POST + partial swap 状态徽标与按钮区）。**resubmit 不做 UI 入口**（登记方重新提交语义，归登记侧任务；状态机能力保留）。
 
@@ -86,6 +86,7 @@
 
 - 已有校验 → 不动；
 - 无校验 → 补合法转换矩阵（pending→approve/reject；approved→revoke；rejected/revoked→resubmit），非法转换抛错，HTTP 层映射 409 错误页。UI 按钮显隐是第一层，状态机校验是防御层，两层都要有。
+- **并发防御（fold codex P1-5）**：状态 UPDATE 必须带旧状态条件（CAS：`UPDATE ingest SET state=$1 WHERE id=$2 AND state=$3`，rowCount=0 → 抛 INVALID_TRANSITION）——先 SELECT 后无条件 UPDATE 存在 TOCTOU（两审核员并发 approve/reject 可致状态/review/tracks 不一致）。review 记录 ID 改用 randomUUID（`r${Date.now()}` 同毫秒可碰撞）。已知边界：ContentDb port 无事务 API（pg-mem 约束），CAS 保证状态转换原子，tracks 投影的失败窗口仅剩"并发双 approve 且 CAS 后 INSERT 前进程崩溃"极端场景。
 
 ### 3.6 数据流
 
@@ -107,13 +108,21 @@
 
 | 场景 | 行为 |
 |---|---|
-| ingest 不存在 | 404 错误页（现状 NOT_FOUND 语义保持） |
-| 非法状态转换（§3.5） | 409 错误页 + 提示当前状态 |
-| reason 超 1000 字符 | 400 + 表单回填错误（对齐 I2 模式） |
+| ingest 不存在 | 404 JSON errBody（现状 NOT_FOUND 语义保持，M2b fix #2 先例） |
+| 非法状态转换（§3.5） | 409 + HTML partial（错误文案 + 当前状态；htmx 4xx 默认不 swap，页面须配 responseHandling，见 §4.1） |
+| reason 超 1000 字符 | 400 + HTML partial（错误文案 + reason 回填） |
 | presign 失败 / 音频加载失败 | 试听区错误提示 / 浏览器原生降级；不阻塞审核操作 |
-| 未登录 | 重定向 login（现状行为） |
-| 角色不足 | 403（现状 requireRole 行为） |
-| DB/渲染异常 | errBody 形状错误页（现状） |
+| 未登录 | 401 JSON（现状 requireRole 行为，不重定向） |
+| 角色不足 | 403 JSON（现状 requireRole 行为） |
+| DB/渲染异常 | errBody 形状 JSON 错误响应（现状） |
+
+### 4.1 htmx 4xx swap 配置（fold codex P1-2）
+
+仓内 htmx 2.0.4 默认 `responseHandling` 对 `[45]..` 为 `swap:false,error:true`——400/409 的 HTML partial 不会被换进页面。所有 admin 页面 head 在 htmx.min.js 之后加：
+
+```html
+<script>htmx.config.responseHandling = [{ code: ".*", swap: true }];</script>
+```
 
 ## 5. 测试矩阵（TDD，先写失败测试）
 
@@ -127,9 +136,11 @@ integration（fastify inject 模式，对齐 M2b T6）：
 | 4 | approve/reject/revoke transition | ingest.state 变更 + review 记录落库 + approve→tracks 出现 / revoke→tracks 消失 |
 | 5 | reason 记录 | reject/revoke 带 reason→review.reason 落库；不带→NULL |
 | 6 | audit emit | approve→provision / reject,revoke→revoke 事件进 sink（配置时） |
-| 7 | 权限门 | operator 可操作；未登录重定向；viewer 档不存在（两档制） |
-| 8 | 非法状态转换被拒 | rejected 再 approve→409（§3.5 防御） |
+| 7 | 权限门 | operator 可操作；未登录 401；viewer 档不存在（两档制） |
+| 8 | 非法状态转换被拒 | rejected 再 approve→409（§3.5 防御 + CAS） |
 | 9 | reason 超长 | >1000 字符→400 回填 |
+| 10 | XSS 转义回归 | reason/元数据含 `<img onerror>`/引号/& → 页面仅含 eta 转义后文本（autoEscape 默认开，测试锁定） |
+| 11 | form-urlencoded 空格 | 真实浏览器 `+` 编码的 reason 落库为空格（解析器修复回归） |
 
 - 既有测试零回归（执行时全量跑，数量以实际为准）。
 - sim e2e 演示（对齐 M2b T8 模式）：ingest 登记 → 审核页操作 → tracks 发布/下架真实可观察（非 mock 断言）。
@@ -168,7 +179,10 @@ integration（fastify inject 模式，对齐 M2b T6）：
 2. sim 认证（静态 token + 内存 session）不适合生产；演进路径 = M1c OIDC/idP（session.ts 注释既定）。
 3. resubmit 无 UI 入口（登记侧任务），rejected/revoked 条目暂只能看不能重新提交。
 4. content_policy 归属张力（ops-config schema 仍含 content_policy kind）不在本任务闭合。
-5. 队列分页为简单 limit，审核量大后需升级（sim 阶段量小）。
+5. 队列分页为简单 limit（100 条截断），审核量大后需升级（sim 阶段量小）。
+6. ContentDb port 无事务 API（pg-mem 约束）：CAS 保证状态转换原子，tracks 投影无事务包裹，极端崩溃场景存在微小不一致窗口（fold codex P1-5 边界说明）。
+7. form-urlencoded 解析器 `+`→空格修复影响既有 ingest 登记表单路径（同一解析器）；该路径既有 e2e 用 %20 编码未暴露此 bug，修复后两路径一致。
+8. CLI 入口（`tsx src/ops-app.ts`）的试听接线无自动化测试（模块入口），SDD 阶段手动启动验证一次。
 
 ## 10. 与上游关系
 

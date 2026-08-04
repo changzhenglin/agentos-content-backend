@@ -31,7 +31,7 @@
 | `src/db/migrations/0003_*.sql` | 新建（drizzle-kit 生成） | review 表加 reason 列 DDL |
 | `src/review/state-machine.ts` | 改 | transition +reason 参数 + 合法转换矩阵校验 |
 | `src/admin/ingest.ts` | 改 | ingestTransitionAndAudit 透传 reason |
-| `src/ops-app.ts` | 改 | 操作门放宽 operator / reason 解析 / 409/400 映射 / 试听路由 / 队列与详情 handler 升级 / opts 加 s3Client |
+| `src/ops-app.ts` | 改 | 操作门放宽 operator / reason 解析 / 409/400 映射 / 试听路由（presignFn 注入+CLI 接线）/ 队列与详情 handler 升级 |
 | `src/admin/views.ts` | 改 | 新渲染函数（页面壳/队列/详情/试听 partial）；删废弃的 renderIngestDetail/renderIngestRow |
 | `src/admin/templates/queue.eta` | 新建 | 待审队列页（布局+导航+表格+空态） |
 | `src/admin/templates/detail.eta` | 新建 | 审核详情页（元数据+试听区+历史+操作区） |
@@ -117,7 +117,7 @@ it("transition without reason stores NULL", async () => {
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `pnpm vitest run test/unit/review-state.test.ts`
-Expected: 新用例 FAIL（pg-mem 报 column "reason" does not exist 或 INSERT 参数数不匹配）；既有用例 PASS。
+Expected: 「with reason」用例 FAIL（旧 INSERT 不写 reason 列）；「without reason」用例**此时即 PASS**（新 DDL 列默认 NULL，NULL 路径守护属预期，不是测试写错——fold Eng M3/codex P2-6）；既有用例 PASS。
 
 - [ ] **Step 3: 实现 schema + 状态机 + ingest 透传**
 
@@ -176,7 +176,7 @@ export async function ingestTransitionAndAudit(
 Run: `pnpm db:generate`
 Expected: `src/db/migrations/0003_<name>.sql` 生成，内容含 `ALTER TABLE "review" ADD COLUMN "reason" text;`；`src/db/migrations/meta/_journal.json` 新增 idx 3 条目；`meta/0003_snapshot.json` 生成。
 
-若 db:generate 失败：手写 `src/db/migrations/0003_review_reason.sql` 内容 `ALTER TABLE "review" ADD COLUMN "reason" text;`，并在 `_journal.json` entries 末尾追加 `{"idx": 3, "version": "7", "when": <当前毫秒时间戳>, "tag": "0003_review_reason", "breakpoints": true}`，同时报告主窗口（drizzle-kit 环境问题需记录）。
+若 db:generate 失败：**停止并报告主窗口**（drizzle-kit 环境问题）。不得手写 migration/journal——手写补 journal 不生成 snapshot 会破坏 drizzle 元数据链完整（后续 generate 报错或重复生成）（fold codex P2-5）。
 
 - [ ] **Step 5: 跑测试确认通过**
 
@@ -264,7 +264,7 @@ Expected: 3 个新用例 FAIL（当前状态机无校验，转换静默成功）
 
 - [ ] **Step 3: 实现合法转换矩阵**
 
-`src/review/state-machine.ts` 在 `NEXT_STATE` 之后加：
+`src/review/state-machine.ts` 顶部 import 加 `import { randomUUID } from "node:crypto";`；`NEXT_STATE` 之后加：
 
 ```ts
 // 合法转换矩阵（spec §3.5 防御层；UI 按钮显隐是第一层）
@@ -276,13 +276,27 @@ const ALLOWED: Record<string, ReviewAction[]> = {
 };
 ```
 
-transition 内 `if (!i) throw new Error("NOT_FOUND");` 之后加：
+transition 内 `if (!i) throw new Error("NOT_FOUND");` 之后加矩阵校验；并把原无条件 UPDATE 改为 **CAS（带旧状态条件）+ rowCount 校验**，reviewId 改 UUID（fold codex P1-5）：
 
 ```ts
   if (!ALLOWED[i.state]?.includes(action)) {
     throw new Error("INVALID_TRANSITION");
   }
+
+  const next = NEXT_STATE[action];
+
+  // CAS：带旧状态条件，并发 approve/reject 只有一个成功；
+  // rowCount=0 = 状态已被他人先改 → INVALID_TRANSITION
+  const upd = await db.query(
+    "UPDATE ingest SET state = $1 WHERE id = $2 AND state = $3",
+    [next, ingestId, i.state],
+  );
+  if ((upd as any).rowCount === 0) throw new Error("INVALID_TRANSITION");
+
+  const reviewId = randomUUID();
 ```
+
+（删除原 `const reviewId = \`r${Date.now()}\`;`——同毫秒可碰撞。注：pg-mem 单线程无法触发真并发，rowCount 分支是真实 PG 并发下的防御；若 pg-mem 的 UPDATE 结果 rowCount 为 undefined，实现时改用「UPDATE 后重读 state 比对」兜底，记入 ledger。）
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -333,7 +347,7 @@ it("operator 可 approve（门放宽 admin→operator）→ 200", async () => {
   expect(r.statusCode).toBe(200);
 });
 
-it("reject 带 reason → review.reason 落库", async () => {
+it("reject 带 reason → review.reason 落库（真实浏览器 + 编码路径，fold codex P1-6）", async () => {
   const cookie = await login("dev-admin");
   const ing = await app.inject({
     method: "POST",
@@ -341,11 +355,13 @@ it("reject 带 reason → review.reason 落库", async () => {
     payload: { track_id: "self:t-reason", raw_metadata: GOOD },
     headers: { cookie },
   });
+  // URLSearchParams 把空格编码为 +（真实浏览器 form 行为）；
+  // 旧解析器只 decodeURIComponent 会落库 "license+unclear"
   const r = await app.inject({
     method: "POST",
     url: `/admin/ingest/${ing.json().id}/reject`,
     headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
-    payload: `reason=${encodeURIComponent("license unclear")}`,
+    payload: new URLSearchParams({ reason: "license unclear" }).toString(),
   });
   expect(r.statusCode).toBe(200);
   const { rows } = await db.query(
@@ -355,7 +371,7 @@ it("reject 带 reason → review.reason 落库", async () => {
   expect(rows[rows.length - 1].reason).toBe("license unclear");
 });
 
-it("已 rejected 再 approve → 409 INVALID_TRANSITION", async () => {
+it("已 rejected 再 approve → 409 + HTML partial（htmx 可 swap，fold codex P1-2）", async () => {
   const cookie = await login("dev-admin");
   const ing = await app.inject({
     method: "POST",
@@ -374,10 +390,11 @@ it("已 rejected 再 approve → 409 INVALID_TRANSITION", async () => {
     headers: { cookie },
   });
   expect(r.statusCode).toBe(409);
-  expect(r.json().error_code).toBe("INVALID_TRANSITION");
+  expect(r.headers["content-type"]).toContain("text/html");
+  expect(r.body).toContain("非法操作");
 });
 
-it("reason 超 1000 字符 → 400 REASON_TOO_LONG", async () => {
+it("reason 超 1000 字符 → 400 + HTML partial 含回填（fold codex P1-2）", async () => {
   const cookie = await login("dev-admin");
   const ing = await app.inject({
     method: "POST",
@@ -385,14 +402,17 @@ it("reason 超 1000 字符 → 400 REASON_TOO_LONG", async () => {
     payload: { track_id: "self:t-long", raw_metadata: GOOD },
     headers: { cookie },
   });
+  const longReason = "x".repeat(1001);
   const r = await app.inject({
     method: "POST",
     url: `/admin/ingest/${ing.json().id}/reject`,
     headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
-    payload: `reason=${"x".repeat(1001)}`,
+    payload: new URLSearchParams({ reason: longReason }).toString(),
   });
   expect(r.statusCode).toBe(400);
-  expect(r.json().error_code).toBe("REASON_TOO_LONG");
+  expect(r.headers["content-type"]).toContain("text/html");
+  expect(r.body).toContain("reason exceeds 1000 chars");
+  expect(r.body).toContain(longReason); // 回填
 });
 ```
 
@@ -401,13 +421,49 @@ it("reason 超 1000 字符 → 400 REASON_TOO_LONG", async () => {
 Run: `pnpm vitest run test/integration/admin-ui.e2e.test.ts`
 Expected: "operator 可 approve" FAIL（403）；"409" FAIL（200 静默转换或 500）；reason 两用例 FAIL（reason 未落库/未校验）。
 
-- [ ] **Step 3: 实现 transitionRoute 改造**
+- [ ] **Step 3: 实现 transitionRoute 改造 + 解析器修复 + 错误 partial**
 
-`src/ops-app.ts` 将 `transitionRoute` 整段替换为：
+**3a. form-urlencoded 解析器修复**（fold codex P1-6）：`src/ops-app.ts` 的 `addContentTypeParser` 内两行解码改为先 `+`→空格再 decodeURIComponent（form-urlencoded 规范：`+` 表示空格，真实浏览器路径；既有 ingest e2e 用 %20 编码未暴露）：
+
+```ts
+        for (const pair of String(body).split("&")) {
+          if (!pair) continue;
+          const eq = pair.indexOf("=");
+          const k = decodeURIComponent(
+            (eq < 0 ? pair : pair.slice(0, eq)).replace(/\+/g, " "),
+          );
+          const v = decodeURIComponent(
+            (eq < 0 ? pair : pair.slice(eq + 1)).replace(/\+/g, " "),
+          );
+          out[k] = v;
+        }
+```
+
+**3b. 错误 partial 模板**：`src/admin/templates/error.eta` 新建：
+
+```eta
+<div class="error"><%= it.message %></div>
+<% if (it.reason != null) { %>
+<textarea name="reason" maxlength="1000"><%= it.reason %></textarea>
+<% } %>
+```
+
+`src/admin/views.ts` TEMPLATES 加 `error: readFileSync("src/admin/templates/error.eta", "utf8"),`，导出：
+
+```ts
+// 审核操作错误 partial（400/409，htmx swap；eta autoEscape 默认开，reason 回填安全）
+export const renderTransitionError = (data: { message: string; reason?: string }) =>
+  render("error", data);
+```
+
+**3c. transitionRoute** 整段替换为：
 
 ```ts
     // approve/reject/revoke：operator 门放宽（spec D5：admin+operator 可审）；
-    // reason 可选（≤1000 字符）；INVALID_TRANSITION→409（spec §3.5 防御层 HTTP 映射）。
+    // reason 可选（≤1000 字符）；NOT_FOUND→404 JSON（M2b fix #2 先例保持）；
+    // INVALID_TRANSITION→409 / REASON_TOO_LONG→400 返 HTML partial
+    //（htmx 2.0.4 默认 4xx 不 swap，页面 head responseHandling 配置 T5 加；
+    // fold codex P1-2）。
     const transitionRoute = (action: "approve" | "reject" | "revoke") =>
       app.post(
         `/admin/ingest/:id/${action}`,
@@ -422,10 +478,14 @@ Expected: "operator 可 approve" FAIL（403）；"409" FAIL（200 静默转换�
           if (reason && reason.length > 1000) {
             return reply
               .code(400)
-              .send(errBody("REASON_TOO_LONG", "reason exceeds 1000 chars"));
+              .type("text/html")
+              .send(
+                renderTransitionError({
+                  message: "reason exceeds 1000 chars",
+                  reason,
+                }),
+              );
           }
-          // transition 内 ingestId 不存在抛 NOT_FOUND；非法状态转换抛
-          // INVALID_TRANSITION（state-machine.ts），分别转 404/409。
           let trackId: string | null;
           try {
             ({ trackId } = await ingestTransitionAndAudit(
@@ -445,8 +505,11 @@ Expected: "operator 可 approve" FAIL（403）；"409" FAIL（200 静默转换�
             if (e?.message === "INVALID_TRANSITION") {
               return reply
                 .code(409)
+                .type("text/html")
                 .send(
-                  errBody("INVALID_TRANSITION", "action not allowed in current state"),
+                  renderTransitionError({
+                    message: "非法操作：当前状态不允许该动作",
+                  }),
                 );
             }
             throw e;
@@ -471,7 +534,9 @@ Expected: "operator 可 approve" FAIL（403）；"409" FAIL（200 静默转换�
     transitionRoute("revoke");
 ```
 
-（本 task 暂保留 renderIngestDetail 响应壳，Task 6 换成完整详情页。）
+`src/ops-app.ts` views import 块加 `renderTransitionError`。
+
+（本 task 成功路径暂保留 renderIngestDetail 响应壳，Task 6 换成完整详情页。）
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -493,24 +558,18 @@ git commit -m "feat(content-backend): 审核操作门放宽 operator + reason/40
 ### Task 4: 试听 presign 懒加载路由
 
 **Files:**
-- Modify: `src/ops-app.ts`（BuildOpsAppOpts + imports + 新路由）
+- Modify: `src/ops-app.ts`（BuildOpsAppOpts + imports + 新路由 + **CLI 入口接线**）
 - Modify: `src/admin/views.ts`（renderAudio）
 - Create: `src/admin/templates/audio.eta`
 - Test: `test/integration/admin-ui.e2e.test.ts`
 
 **Interfaces:**
-- Consumes: `presignUrl(client, bucket, key)` from `src/storage/presign.ts`；`createS3(endpoint, region, accessKeyId, secretAccessKey)` from `src/storage/s3-client.ts`
-- Produces: `GET /admin/ingest/:id/audio`（requireRole("operator")）返回 HTML partial：有音频=`<audio controls src="<presigned>">`；无音频/未配置/失败=提示文案；`BuildOpsAppOpts` 新增可选 `s3Client?: S3Client`、`s3Bucket?: string`
+- Consumes: `presignUrl(client, bucket, key)` from `src/storage/presign.ts`；`createS3(endpoint, region, accessKeyId, secretAccessKey)` from `src/storage/s3-client.ts`（仅 CLI 接线用）
+- Produces: `GET /admin/ingest/:id/audio`（requireRole("operator")）返回 HTML partial：有音频=`<audio controls src="<presigned>">`；无音频/未配置/失败=提示文案；`BuildOpsAppOpts` 新增可选 `presignFn?: (key: string) => Promise<{ url: string }>`（注入式，对齐 index.ts 既有 PresignFn hexagonal 模式，fold codex P2-2；CLI 默认用 env.s3 构造，fold Eng I1/codex P1-3）
 
 - [ ] **Step 1: 写失败测试**
 
-`test/integration/admin-ui.e2e.test.ts` 顶部 import 加：
-
-```ts
-import { createS3 } from "../../src/storage/s3-client.js";
-```
-
-beforeAll 中 buildOpsApp 参数加两个字段：
+`test/integration/admin-ui.e2e.test.ts` beforeAll 中 buildOpsApp 参数加一个字段：
 
 ```ts
   app = await buildOpsApp({
@@ -518,17 +577,16 @@ beforeAll 中 buildOpsApp 参数加两个字段：
     auditSink: createAuditSink(auditPath),
     adminToken: "dev-admin",
     operatorToken: "dev-op",
-    s3Client: createS3("http://localhost:9999", "us-east-1", "test", "test"),
-    s3Bucket: "test-bucket",
+    presignFn: async (_key: string) => ({
+      url: "https://example.test/audio?X-Amz-Signature=abc123",
+    }),
   });
 ```
-
-（presign 是离线签名，不发起网络请求，localhost:9999 无需真实存在。）
 
 describe 块内追加：
 
 ```ts
-it("试听路由：有音频 → <audio> + presigned URL", async () => {
+it("试听路由：有音频 → <audio> + presigned URL（注入 presignFn）", async () => {
   const cookie = await login("dev-admin");
   const ing = await app.inject({
     method: "POST",
@@ -543,7 +601,7 @@ it("试听路由：有音频 → <audio> + presigned URL", async () => {
   });
   expect(r.statusCode).toBe(200);
   expect(r.body).toContain("<audio");
-  expect(r.body).toContain("X-Amz-Signature");
+  expect(r.body).toContain("X-Amz-Signature=abc123");
 });
 
 it("试听路由：无音频 → 提示仅元数据审核", async () => {
@@ -563,7 +621,40 @@ it("试听路由：无音频 → 提示仅元数据审核", async () => {
   expect(r.body).toContain("无音频");
 });
 
-it("试听路由：未登录 → 401；不存在 → 404", async () => {
+it("试听路由：presign 失败 → 降级提示不阻塞（catch 分支，fold codex P2-2）", async () => {
+  const failApp = await buildOpsApp({
+    db,
+    adminToken: "dev-admin",
+    operatorToken: "dev-op",
+    presignFn: async () => {
+      throw new Error("s3 down");
+    },
+  });
+  const lr = await failApp.inject({
+    method: "POST",
+    url: "/admin/login",
+    payload: { token: "dev-admin" },
+  });
+  const cookie = Array.isArray(lr.headers["set-cookie"])
+    ? lr.headers["set-cookie"][0]
+    : lr.headers["set-cookie"];
+  const ing = await failApp.inject({
+    method: "POST",
+    url: "/admin/ingest",
+    payload: { track_id: "self:t-s3fail", raw_metadata: GOOD, audioObjectKey: "audio/kf" },
+    headers: { cookie },
+  });
+  const r = await failApp.inject({
+    method: "GET",
+    url: `/admin/ingest/${ing.json().id}/audio`,
+    headers: { cookie },
+  });
+  expect(r.statusCode).toBe(200);
+  expect(r.body).toContain("试听获取失败");
+  await failApp.close();
+});
+
+it("试听路由：未登录 → 401；不存在 → 404；未配置 → 提示", async () => {
   const r1 = await app.inject({ method: "GET", url: "/admin/ingest/i-x/audio" });
   expect(r1.statusCode).toBe(401);
   const cookie = await login("dev-op");
@@ -573,32 +664,29 @@ it("试听路由：未登录 → 401；不存在 → 404", async () => {
     headers: { cookie },
   });
   expect(r2.statusCode).toBe(404);
-});
-
-it("试听路由：s3 未配置 → 提示未配置（不阻塞审核）", async () => {
   const app2 = await buildOpsApp({
     db,
     adminToken: "dev-admin",
     operatorToken: "dev-op",
   });
-  const r = await app2.inject({
+  const lr = await app2.inject({
     method: "POST",
     url: "/admin/login",
     payload: { token: "dev-admin" },
   });
-  const cookie = Array.isArray(r.headers["set-cookie"])
-    ? r.headers["set-cookie"][0]
-    : r.headers["set-cookie"];
+  const cookie2 = Array.isArray(lr.headers["set-cookie"])
+    ? lr.headers["set-cookie"][0]
+    : lr.headers["set-cookie"];
   const ing = await app2.inject({
     method: "POST",
     url: "/admin/ingest",
     payload: { track_id: "self:t-nos3", raw_metadata: GOOD, audioObjectKey: "audio/k9" },
-    headers: { cookie },
+    headers: { cookie: cookie2 },
   });
   const a = await app2.inject({
     method: "GET",
     url: `/admin/ingest/${ing.json().id}/audio`,
-    headers: { cookie },
+    headers: { cookie: cookie2 },
   });
   expect(a.statusCode).toBe(200);
   expect(a.body).toContain("试听未配置");
@@ -640,8 +728,8 @@ export const renderAudio = (data: { url?: string; notice?: string }) =>
 `src/ops-app.ts`：imports 区加：
 
 ```ts
-import type { S3Client } from "@aws-sdk/client-s3";
 import { presignUrl } from "./storage/presign.js";
+import { createS3 } from "./storage/s3-client.js";
 import {
   renderLogin,
   renderTracksList,
@@ -653,11 +741,10 @@ import {
 
 （原 views import 块替换为上面这段。）
 
-`BuildOpsAppOpts` 加两个可选字段：
+`BuildOpsAppOpts` 加一个可选字段（注入式，对齐 index.ts PresignFn 模式）：
 
 ```ts
-  s3Client?: S3Client; // 试听 presign 用（未配置则试听区显示提示，不阻塞审核）
-  s3Bucket?: string;
+  presignFn?: (key: string) => Promise<{ url: string }>; // 试听 presign（CLI 默认 env.s3 构造；未配置则试听区显示提示，不阻塞审核）
 ```
 
 GET routes 区（`/admin/tracks` 之后、POST routes 之前）加：
@@ -686,13 +773,13 @@ GET routes 区（`/admin/tracks` 之后、POST routes 之前）加：
             .type("text/html")
             .send(renderAudio({ notice: "无音频，仅元数据审核" }));
         }
-        if (!opts.s3Client || !opts.s3Bucket) {
+        if (!opts.presignFn) {
           return reply
             .type("text/html")
-            .send(renderAudio({ notice: "试听未配置（S3 缺失）" }));
+            .send(renderAudio({ notice: "试听未配置" }));
         }
         try {
-          const { url } = await presignUrl(opts.s3Client, opts.s3Bucket, key);
+          const { url } = await opts.presignFn(key);
           return reply.type("text/html").send(renderAudio({ url }));
         } catch {
           return reply
@@ -702,6 +789,26 @@ GET routes 区（`/admin/tracks` 之后、POST routes 之前）加：
       },
     );
 ```
+
+**CLI 接线（fold Eng I1/codex P1-3——缺这步真实启动的 app 试听恒「未配置」）**：文件尾部 CLI 块（`if (import.meta.url === ...)` 段）在 `const app = await buildOpsApp({` 之前加：
+
+```ts
+  const s3 = createS3(
+    env.s3.endpoint,
+    env.s3.region,
+    env.s3.accessKeyId,
+    env.s3.secretAccessKey,
+  );
+```
+
+buildOpsApp 调用参数追加：
+
+```ts
+    presignFn: (key: string) =>
+      presignUrl(s3, env.s3.bucket, key).then((r) => ({ url: r.url })),
+```
+
+注：CLI 接线无自动化测试（模块入口，spec known hole 8），T7 记录手动验证项。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -731,15 +838,24 @@ git commit -m "feat(content-backend): 审核详情试听 presign 懒加载路由
 
 **Interfaces:**
 - Consumes: Task 4 后的 views.ts 渲染体系
-- Produces: `renderQueuePage(items: {id, track_id, created_at}[])`（完整 HTML 页，含导航/空态）；导航文案固定「待审核」「已发布曲目」
+- Produces: `renderQueuePage(items: {id, track_id, state, title, artist, created_at}[])`（完整 HTML 页，含导航/标题/艺人/徽标/空态）；导航文案固定「待审核」「已发布曲目」
 
 - [ ] **Step 1: 写失败测试**
 
 `test/integration/admin-ui.e2e.test.ts` describe 块内追加：
 
 ```ts
-it("队列页含布局导航/条目链接/空态", async () => {
+it("队列页：自建条目 → 导航/链接/标题/艺人/徽标/空态文案齐（fold Eng I3/codex P1-4/P2-4）", async () => {
   const cookie = await login("dev-admin");
+  const ing = await app.inject({
+    method: "POST",
+    url: "/admin/ingest",
+    payload: {
+      track_id: "self:t-queue",
+      raw_metadata: { ...GOOD, title: "QueueSong", artist: "QueueArtist" },
+    },
+    headers: { cookie },
+  });
   const r = await app.inject({
     method: "GET",
     url: "/admin/ingests",
@@ -748,7 +864,10 @@ it("队列页含布局导航/条目链接/空态", async () => {
   expect(r.statusCode).toBe(200);
   expect(r.body).toContain("待审核");
   expect(r.body).toContain("已发布曲目");
-  expect(r.body).toContain("/admin/ingest/"); // 条目链接进详情页
+  expect(r.body).toContain(`/admin/ingest/${ing.json().id}`);
+  expect(r.body).toContain("QueueSong");
+  expect(r.body).toContain("QueueArtist");
+  expect(r.body).toContain("responseHandling"); // htmx 4xx swap 配置在 head（fold codex P1-2）
 });
 
 it("队列页空态（无 pending）", async () => {
@@ -794,22 +913,24 @@ Expected: 新用例 FAIL（无导航文案/无空态）。
 
 - [ ] **Step 3: 实现**
 
-`src/admin/templates/queue.eta` 新建：
+`src/admin/templates/queue.eta` 新建（head 含 htmx 4xx swap 配置，fold codex P1-2；标题/艺人列 fold Eng I3/codex P1-4）：
 
 ```eta
-<!doctype html><html><head><meta charset="utf-8"><script src="/public/htmx.min.js"></script></head><body>
+<!doctype html><html><head><meta charset="utf-8"><script src="/public/htmx.min.js"></script><script>htmx.config.responseHandling = [{ code: ".*", swap: true }];</script></head><body>
 <nav><a href="/admin/ingests">待审核</a> | <a href="/admin/tracks">已发布曲目</a></nav>
 <h1>待审核 ingest</h1>
 <% if (it.items.length === 0) { %>
 <p>无待审核 ingest</p>
 <% } else { %>
 <table>
-<tr><th>track_id</th><th>提交时间</th><th>状态</th></tr>
+<tr><th>track_id</th><th>标题</th><th>艺人</th><th>提交时间</th><th>状态</th></tr>
 <% it.items.forEach(i => { %>
 <tr>
 <td><a href="/admin/ingest/<%= i.id %>"><%= i.track_id %></a></td>
+<td><%= i.title %></td>
+<td><%= i.artist %></td>
 <td><%= i.created_at %></td>
-<td><%= i.state %></td>
+<td><span class="badge badge-<%= i.state %>"><%= i.state %></span></td>
 </tr>
 <% }) %>
 </table>
@@ -817,16 +938,15 @@ Expected: 新用例 FAIL（无导航文案/无空态）。
 </body></html>
 ```
 
-`src/admin/templates/tracks.eta` 替换为（自刷新用 hx-select 只取表格 div，避免整页嵌套 nav）：
+`src/admin/templates/tracks.eta` 替换为（**移除 M2b 遗留 10s 自刷新**——原实现整页响应 swap 进 div 有嵌套/重复 ID bug，审核场景手动刷新足够，fold codex P1-1；head 带 responseHandling 配置）：
 
 ```eta
-<!doctype html><html><head><meta charset="utf-8"><script src="/public/htmx.min.js"></script></head><body>
+<!doctype html><html><head><meta charset="utf-8"><script src="/public/htmx.min.js"></script><script>htmx.config.responseHandling = [{ code: ".*", swap: true }];</script></head><body>
 <nav><a href="/admin/ingests">待审核</a> | <a href="/admin/tracks">已发布曲目</a></nav>
 <h1>已发布 tracks</h1>
-<div id="tracks-table" hx-get="/admin/tracks" hx-trigger="every 10s" hx-swap="innerHTML" hx-select="#tracks-table">
 <table><tr><th>track_id</th><th>title</th><th>artist</th></tr>
 <% it.tracks.forEach(t => { %><tr><td><%= t.track_id %></td><td><%= t.title %></td><td><%= t.artist %></td></tr><% }) %>
-</table></div></body></html>
+</table></body></html>
 ```
 
 `src/admin/views.ts` TEMPLATES 加：
@@ -839,11 +959,18 @@ Expected: 新用例 FAIL（无导航文案/无空态）。
 
 ```ts
 export const renderQueuePage = (
-  items: { id: string; track_id: string; state: string; created_at: string }[],
+  items: {
+    id: string;
+    track_id: string;
+    state: string;
+    title: string;
+    artist: string;
+    created_at: string;
+  }[],
 ) => render("queue", { items });
 ```
 
-`src/ops-app.ts` `/admin/ingests` handler 替换为：
+`src/ops-app.ts` `/admin/ingests` handler 替换为（标题/艺人从 raw_metadata 解析 + 显式 LIMIT 100，fold Eng I3/codex P1-4）：
 
 ```ts
     app.get(
@@ -851,14 +978,27 @@ export const renderQueuePage = (
       { preHandler: requireRole("operator") },
       async (_req, reply) => {
         const { rows } = await opts.db.query(
-          "SELECT id, track_id, state, created_at FROM ingest WHERE state='pending' ORDER BY created_at",
+          "SELECT id, track_id, state, raw_metadata, created_at FROM ingest WHERE state='pending' ORDER BY created_at LIMIT 100",
         );
-        const items = rows.map((r: any) => ({
-          id: String(r.id),
-          track_id: String(r.track_id),
-          state: String(r.state),
-          created_at: String(r.created_at ?? ""),
-        }));
+        const items = rows.map((r: any) => {
+          let title = "";
+          let artist = "";
+          try {
+            const meta = JSON.parse(String(r.raw_metadata ?? "{}"));
+            title = meta.title != null ? String(meta.title) : "";
+            artist = meta.artist != null ? String(meta.artist) : "";
+          } catch {
+            // raw_metadata 异常不阻塞队列渲染
+          }
+          return {
+            id: String(r.id),
+            track_id: String(r.track_id),
+            state: String(r.state),
+            title,
+            artist,
+            created_at: String(r.created_at ?? ""),
+          };
+        });
         return reply.type("text/html").send(renderQueuePage(items));
       },
     );
@@ -894,7 +1034,7 @@ git commit -m "feat(content-backend): 审核 UI 布局导航与队列页升级"
 
 **Interfaces:**
 - Consumes: Task 4 试听路由（详情页 hx-get 懒加载）；Task 1 review.reason；Task 3 操作路由（form 提交 reason）
-- Produces: `renderDetailPage(data: {ingest: {id, track_id, state, created_at, meta: Record<string, unknown>, hasAudio: boolean}, history: {actor, action, reason, at}[]})`；操作响应返回完整详情页 HTML；状态文案沿用「已审核」「已拒」，revoked 用「已下架」
+- Produces: `renderDetailPage(data: {ingest: {id, track_id, state, meta: Record<string, unknown>}, history: {actor, action, reason, at}[]})`（代码块为准，fold Eng M4 散文同步）；操作响应返回完整详情页 HTML；状态文案沿用「已审核」「已拒」，revoked 用「已下架」
 
 - [ ] **Step 1: 写失败测试**
 
@@ -956,7 +1096,9 @@ it("详情页 approved 状态显示 revoke、隐藏 approve", async () => {
     headers: { cookie },
   });
   expect(r.body).toContain("revoke");
-  expect(r.body).not.toContain(">approve<");
+  // 断言 approve 按钮不存在（历史区 <td>approve</td> 含 ">approve<" 子串，
+  // 不能拿它断言按钮隐藏——fold Eng I2）
+  expect(r.body).not.toContain(`hx-post="/admin/ingest/${ing.json().id}/approve"`);
   expect(r.body).toContain("已审核");
 });
 
@@ -972,7 +1114,7 @@ it("详情页审核历史含 actor/action/reason", async () => {
     method: "POST",
     url: `/admin/ingest/${ing.json().id}/reject`,
     headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
-    payload: `reason=${encodeURIComponent("history check")}`,
+    payload: new URLSearchParams({ reason: "history check" }).toString(),
   });
   const r = await app.inject({
     method: "GET",
@@ -981,6 +1123,35 @@ it("详情页审核历史含 actor/action/reason", async () => {
   });
   expect(r.body).toContain("reject");
   expect(r.body).toContain("history check");
+});
+
+it("reason/元数据 XSS：eta autoEscape 回归（fold codex P2-7）", async () => {
+  const cookie = await login("dev-admin");
+  const ing = await app.inject({
+    method: "POST",
+    url: "/admin/ingest",
+    payload: {
+      track_id: "self:t-xss",
+      raw_metadata: { ...GOOD, title: '<img src=x onerror=alert(1)>' },
+    },
+    headers: { cookie },
+  });
+  await app.inject({
+    method: "POST",
+    url: `/admin/ingest/${ing.json().id}/reject`,
+    headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+    payload: new URLSearchParams({ reason: '"><script>alert(1)</script>' }).toString(),
+  });
+  const r = await app.inject({
+    method: "GET",
+    url: `/admin/ingest/${ing.json().id}`,
+    headers: { cookie },
+  });
+  expect(r.statusCode).toBe(200);
+  expect(r.body).not.toContain("<script>alert(1)</script>");
+  expect(r.body).not.toContain("<img src=x");
+  expect(r.body).toContain("&lt;script&gt;"); // eta 4.x autoEscape 默认开，锁定防回归
+  expect(r.body).toContain("&lt;img");
 });
 ```
 
@@ -1171,7 +1342,6 @@ git commit -m "feat(content-backend): 审核详情页升级（元数据/试听/�
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { buildOpsApp } from "../../src/ops-app.js";
 import { createTestDb } from "./helpers.js";
-import { createS3 } from "../../src/storage/s3-client.js";
 import { createAuditSink } from "../../src/audit/audit-sink.js";
 import { rmSync, readFileSync } from "node:fs";
 
@@ -1185,8 +1355,9 @@ beforeAll(async () => {
     auditSink: createAuditSink(auditPath),
     adminToken: "dev-admin",
     operatorToken: "dev-op",
-    s3Client: createS3("http://localhost:9999", "us-east-1", "test", "test"),
-    s3Bucket: "test-bucket",
+    presignFn: async (_key: string) => ({
+      url: "https://example.test/audio?X-Amz-Signature=acc-test",
+    }),
   });
 });
 
@@ -1252,44 +1423,73 @@ describe("审核 UI 验收全链路", () => {
     expect(tracks.body).toContain("self:acc1");
   });
 
-  it("revoke → tracks 消失 + 审核历史含记录", async () => {
-    const opCookie = await login("dev-op");
-    const { rows } = await db.query(
-      "SELECT id FROM ingest WHERE track_id = 'self:acc1'",
-    );
-    const id = String(rows[0].id);
+  it("approve 后 revoke → tracks 消失 + 审核历史含理由（独立种子，fold codex P2-3）", async () => {
+    const adminCookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:acc2", raw_metadata: { ...META, title: "Acc2" }, audioObjectKey: "audio/acc2" },
+      headers: { cookie: adminCookie },
+    });
+    const id = ing.json().id;
+    await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${id}/approve`,
+      headers: { cookie: adminCookie },
+    });
     const rv = await app.inject({
       method: "POST",
       url: `/admin/ingest/${id}/revoke`,
-      headers: { cookie: opCookie, "content-type": "application/x-www-form-urlencoded" },
-      payload: `reason=${encodeURIComponent("acceptance takedown")}`,
+      headers: { cookie: adminCookie, "content-type": "application/x-www-form-urlencoded" },
+      payload: new URLSearchParams({ reason: "acceptance takedown" }).toString(),
     });
     expect(rv.statusCode).toBe(200);
 
     const tracks = await app.inject({
       method: "GET",
       url: "/admin/tracks",
-      headers: { cookie: opCookie },
+      headers: { cookie: adminCookie },
     });
-    expect(tracks.body).not.toContain("self:acc1");
+    expect(tracks.body).not.toContain("self:acc2");
 
     const detail = await app.inject({
       method: "GET",
       url: `/admin/ingest/${id}`,
-      headers: { cookie: opCookie },
+      headers: { cookie: adminCookie },
     });
     expect(detail.body).toContain("acceptance takedown");
     expect(detail.body).toContain("已下架");
   });
 
-  it("audit JSONL 含 provision/revoke 事件", async () => {
+  it("audit JSONL 含 provision/revoke 事件（独立种子 + 按 target 过滤，fold codex P2-3）", async () => {
+    const adminCookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:acc3", raw_metadata: { ...META, title: "Acc3" } },
+      headers: { cookie: adminCookie },
+    });
+    await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${ing.json().id}/approve`,
+      headers: { cookie: adminCookie },
+    });
+    await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${ing.json().id}/revoke`,
+      headers: { cookie: adminCookie },
+    });
     const lines = readFileSync(auditPath, "utf8").trim().split("\n");
-    const events = lines.map((l) => JSON.parse(l));
+    const events = lines
+      .map((l) => JSON.parse(l))
+      .filter((e) => e.target === "self:acc3");
     expect(events.some((e) => e.eventType === "provision")).toBe(true);
     expect(events.some((e) => e.eventType === "revoke")).toBe(true);
   });
 });
 ```
+
+（三个用例各自独立种子/独立断言，单跑、筛选、重试均不依赖前序用例——fold codex P2-3。）
 
 - [ ] **Step 2: 跑验收测试确认通过**
 
@@ -1304,9 +1504,11 @@ Expected: 全 PASS，零回归。
 Run: `pnpm build`
 Expected: tsc exit 0。
 
-- [ ] **Step 4: README 补审核工作台小节**
+- [ ] **Step 4: README 补审核工作台小节 + 修 stale 描述**
 
-README.md 已有 `## M2b 审核 UI + content_policy 消费通道` 节（约 line 75 起）。在该节末尾追加子节：
+先修 stale 行（fold Eng M5）：README.md 环境变量表约 line 101 `CONTENT_BACKEND_OPERATOR_TOKEN` 描述从「operator token（只读审核队列）」改为「operator token（可执行审核操作 approve/reject/revoke）」。
+
+再在已有 `## M2b 审核 UI + content_policy 消费通道` 节（约 line 75 起）末尾追加子节：
 
 ```markdown
 ### 审核工作台（2026-08-04 演进）
@@ -1329,8 +1531,30 @@ git commit -m "test(content-backend): 审核 UI sim e2e 验收与 README 使用�
 
 ---
 
-## Self-Review 记录
+## Fold 记录（plan v2，2026-08-04：Eng 3I/5M + codex 跨厂商 7P1/6P2 全 fold）
 
-- **Spec 覆盖**：§3.1 页面交互→T5/T6；§3.2 试听→T4；§3.3 角色门→T3；§3.4 reason→T1/T3/T6；§3.5 状态机防御→T2/T3；§3.6 数据流→T1-T6 整体；§4 错误处理表→T2/T3/T4（404/409/400/presign 降级/401/403 既有）；§5 测试矩阵 9 项→T1-T7 逐项对应（1→T5，2→T6，3→T4，4→T3/T7，5→T1/T3/T7，6→T7 audit，7→T3，8→T2/T3，9→T3）；§6 验收标准→T7；§9 known holes 属 spec 标注无需实现。
+| 来源 | finding | 处置 |
+|---|---|---|
+| Eng I1 = codex P1-3 | CLI 入口缺试听接线 | fold：T4 加 CLI 接线步骤（createS3+presignFn），known hole 8 标注无自动化测试 |
+| Eng I2 | `not.toContain(">approve<")` 自相矛盾 | fold：T6 断言改查 approve 按钮 hx-post 不存在 |
+| Eng I3 = codex P1-4 | 队列缺标题/艺人列（codex 另指出无 LIMIT） | fold：T5 SELECT raw_metadata 解析 + 两列 + 徽标 + LIMIT 100 |
+| Eng M1 × codex P1-2 | 400/409 JSON + htmx 2.0.4 默认 4xx 不 swap（实证） | fold：T3 改 HTML error partial（error.eta + renderTransitionError）；T5/T6 页面 head 加 responseHandling 配置；测试断言 HTML；spec §4/§4.1 更新 |
+| Eng M2 = codex P1-7 | spec 未登录「重定向」失实（现状 401） | fold：spec §4 改 401；plan 测试不动 |
+| Eng M3 = codex P2-6 | T1 watch-fail 预期失准 | fold：T1 Step 2 预期改 1 FAIL/1 PASS（NULL 守护） |
+| Eng M4 | Interfaces 散文签名不一致 | fold：T5/T6 Interfaces 与代码块同步 |
+| Eng M5 | README:101 stale | fold：T7 顺手改 |
+| codex P1-1 | tracks 10s 自刷新 + hx-select 嵌套风险 | fold（YAGNI 路线）：移除自刷新（M2b 原实现本有嵌套 bug）；spec §3.1 更新 |
+| codex P1-5 | transition TOCTOU + reviewId 碰撞 | fold：T2 CAS UPDATE（带旧状态条件+rowCount）+ randomUUID；无事务边界入 spec known hole 6 |
+| codex P1-6 | form-urlencoded `+`→空格解析 bug（现状真 bug） | fold：T3 解析器修复 + URLSearchParams 测试；spec known hole 7 |
+| codex P2-1 | 统一 HTML 错误页 | 部分驳回：404 保持 JSON errBody（M2b fix #2 先例+既有测试），transition 错误走 HTML partial；spec §4 措辞更新 |
+| codex P2-2 | presign catch 分支无测试 | fold：T4 改 presignFn 注入（对齐 index.ts PresignFn 模式）+ 抛错注入测试 |
+| codex P2-3 | 验收用例互相依赖 | fold：T7 三用例独立种子/独立断言 |
+| codex P2-4 | 队列链接测试依赖前序数据 | fold：T5 用例内自建 pending 条目 + 精确断言 |
+| codex P2-5 | migration fallback 伪造 journal | fold：T1 移除手写 fallback，失败即停报告 |
+| codex P2-7 | XSS 无回归测试 | fold：T6 加 eta autoEscape 回归测试（eta 4.x autoEscape 默认开已实证）+ spec §5 #10/#11 |
+
+## Self-Review 记录（v2）
+
+- **Spec 覆盖**：§3.1 页面交互→T5/T6（队列 5 列齐+LIMIT）；§3.2 试听→T4（含 CLI 接线）；§3.3 角色门→T3；§3.4 reason→T1/T3/T6；§3.5 状态机防御（含 CAS）→T2/T3；§3.6 数据流→T1-T7；§4 错误处理表（含 §4.1 responseHandling）→T2/T3/T5；§5 测试矩阵 11 项→T1-T7 逐项对应（1→T5，2→T6，3→T4，4→T3/T7，5→T1/T3/T7，6→T7，7→T3/T4，8→T2/T3，9→T3，10→T6，11→T3）；§6 验收→T7；§9 known holes 6/7/8 对应 T2/T3/T4 边界。
 - **Placeholder scan**：无 TBD/TODO；每步含代码或命令+预期。
-- **类型一致性**：`transition(db, ingestId, action, actor, reason?)` 与 `ingestTransitionAndAudit(db, auditSink, ingestId, action, actor, reason?)` 全 plan 一致；`renderDetailPage` 入参形状 T6 定义、T6 内消费一致；`renderAudio({url?|notice?})` T4 一致。
+- **类型一致性**：`transition(db, ingestId, action, actor, reason?)` / `ingestTransitionAndAudit(db, auditSink, ingestId, action, actor, reason?)` 全 plan 一致；`renderDetailPage` 入参 T6 定义与消费一致（散文已同步）；`renderAudio({url?|notice?})`、`renderTransitionError({message, reason?})`、`presignFn?: (key) => Promise<{url: string}>` 各处一致。
