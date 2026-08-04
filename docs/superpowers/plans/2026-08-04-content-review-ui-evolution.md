@@ -260,7 +260,7 @@ it("resubmit on approved ingest throws INVALID_TRANSITION", async () => {
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `pnpm vitest run test/unit/review-state.test.ts`
-Expected: 3 个新用例 FAIL（当前状态机无校验，转换静默成功）。
+Expected: 4 个新用例 FAIL（3 个矩阵用例 + CAS race 用例——当前状态机无校验不抛错）；CAS SQL 语义用例**此时即 PASS**（SQL 语义守护，属预期）。
 
 - [ ] **Step 3: 实现合法转换矩阵**
 
@@ -330,6 +330,37 @@ it("CAS 语义：RETURNING 命中返行、未命中返空且不改状态（fold 
 ```
 
 （此用例为 SQL 语义守护：pg-mem 3.0.14 实测支持 UPDATE...RETURNING——主窗口 2026-08-04 已运行时实证。若未来 pg-mem 升级破坏该行为，此测试 RED 即暴露。）
+
+再追加一个 **transition() 级 CAS miss 行为守护**（fold wave 4 codex r4 P2：上一用例只跑裸 SQL，若实现漏掉 `rows.length===0→throw` 判断仍会全绿——用可控 db 包装模拟并发赢家）：
+
+```ts
+it("transition CAS miss：并发赢家时抛 INVALID_TRANSITION 且无副作用（fold wave 4 codex r4 P2）", async () => {
+  const db = setup();
+  await seedIngest(db, {
+    id: "i1",
+    trackId: "self:t1",
+    source: "self_hosted",
+    rawMetadata: META,
+    state: "pending",
+  });
+  // 模拟并发赢家：CAS UPDATE 执行前，另一审核员先 approve（state 变为 approved）
+  const raceDb: ContentDb = {
+    async query(text: string, params?: unknown[]) {
+      if (text.startsWith("UPDATE ingest") && text.includes("RETURNING id")) {
+        await db.query("UPDATE ingest SET state='approved' WHERE id='i1'");
+      }
+      return db.query(text, params as any[]);
+    },
+  };
+  await expect(
+    transition(raceDb, "i1", "approve", "user:admin"),
+  ).rejects.toThrow("INVALID_TRANSITION");
+  // 无副作用：miss 方不写 review 记录、不做 tracks 投影
+  const reviews = await db.query("SELECT count(*)::int AS c FROM review");
+  expect(Number(reviews.rows[0].c)).toBe(0);
+  expect(await tracksCount(db)).toBe(0);
+});
+```
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -1620,6 +1651,12 @@ git commit -m "test(content-backend): 审核 UI sim e2e 验收与 README 使用�
 
 ---
 
+## Fold 记录（plan v5，2026-08-04 fold wave 4：r4 收敛——Eng READY_FOR_SDD 0 新面 + codex 4/4 RESOLVED + 1 P2 fold）
+
+| 来源 | finding | 处置 |
+|---|---|---|
+| codex r4 P2 | CAS 语义用例只跑裸 SQL，不守护 transition() 级 `rows.length===0→throw` 业务行为（实现漏掉判断仍全绿） | fold：T2 加 transition() 级 CAS miss 行为测试（可控 raceDb 包装模拟并发赢家，断言抛 INVALID_TRANSITION + 无 review/tracks 副作用）；Step 2 Expected 计数更新（4 FAIL + SQL 语义用例 PASS） |
+
 ## Fold 记录（plan v4，2026-08-04 fold wave 3：第三轮 scoped re-review 收敛——Eng 5/5 CLOSED + codex 6/8 RESOLVED，CAS 竞态两路独立收敛）
 
 | 来源 | finding | 处置 |
@@ -1667,8 +1704,9 @@ git commit -m "test(content-backend): 审核 UI sim e2e 验收与 README 使用�
 | codex P2-5 | migration fallback 伪造 journal | fold：T1 移除手写 fallback，失败即停报告 |
 | codex P2-7 | XSS 无回归测试 | fold：T6 加 eta autoEscape 回归测试（eta 4.x autoEscape 默认开已实证）+ spec §5 #10/#11 |
 
-## Self-Review 记录（v4）
+## Self-Review 记录（v5）
 
+- **wave 4 增量核验**：T2 CAS 守护双层——SQL 语义用例（RETURNING 命中/miss）+ transition() 级 race 用例（并发赢家→抛错+零副作用）；实现漏判不再可能全绿。
 - **wave 3 增量核验**：CAS=RETURNING 所有权判定（命中/miss 两分支测试守护，pg-mem 实证支持）；spec §3.5 与 plan CAS 语义一致（rowCount 措辞已删）；T7 track id 每 attempt 随机+audit 文件按 RUN 隔离；T3 Interfaces 与 spec §4 错误响应定形一致；T7 手动验证 ledger 落点明确。
 - **wave 2 增量核验**：responseHandling 三页齐（queue/tracks/detail）；错误 partial 自包含可操作（400 重试/409 返回）；解析器无=分支空串；T3 commit stage 完整；T4/T6 import 含 renderTransitionError；XSS 四字符锁定；T7 retry 隔离（RUN 后缀+audit 清理）；T7 手动验证承接 known hole 8。
 - **Spec 覆盖**：§3.1 页面交互→T5/T6（队列 5 列齐+LIMIT）；§3.2 试听→T4（含 CLI 接线+T7 手动验证）；§3.3 角色门→T3；§3.4 reason→T1/T3/T6；§3.5 状态机防御（含 CAS RETURNING）→T2/T3；§3.6 数据流→T1-T7；§4 错误处理表（含 §4.1 responseHandling + 自包含 partial 形状）→T2/T3/T5/T6；§5 测试矩阵 11 项→T1-T7 逐项对应；§6 验收→T7；§9 known holes 6/7/8 对应 T2/T3/T4 边界。
