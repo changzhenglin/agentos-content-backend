@@ -276,7 +276,7 @@ const ALLOWED: Record<string, ReviewAction[]> = {
 };
 ```
 
-transition 内 `if (!i) throw new Error("NOT_FOUND");` 之后加矩阵校验；并把原无条件 UPDATE 改为 **CAS（带旧状态条件）+ 重读比对**，reviewId 改 UUID（fold codex P1-5；rowCount 改重读——ContentDb 契约只保证 rows 不保证 rowCount，fold wave 2 codex P2）：
+transition 内 `if (!i) throw new Error("NOT_FOUND");` 之后加矩阵校验；并把原无条件 UPDATE 改为 **CAS（带旧状态条件）+ RETURNING 所有权判定**，reviewId 改 UUID（fold codex P1-5；fold wave 3：rowCount 契约外→曾改重读比对→重读对同动作并发有伪不变量，终局用 RETURNING，codex r3 P1/Eng NEW-6 双路收敛）：
 
 ```ts
   if (!ALLOWED[i.state]?.includes(action)) {
@@ -285,25 +285,25 @@ transition 内 `if (!i) throw new Error("NOT_FOUND");` 之后加矩阵校验；�
 
   const next = NEXT_STATE[action];
 
-  // CAS：带旧状态条件，并发 approve/reject 只有一个成功（UPDATE 行锁串行化）
-  await db.query(
-    "UPDATE ingest SET state = $1 WHERE id = $2 AND state = $3",
+  // CAS：带旧状态条件，并发 approve/reject 只有一个成功（UPDATE 行锁串行化）。
+  // RETURNING 证明 UPDATE 所有权：命中方得 rows，miss 方得空数组——
+  // 同动作并发下 miss 方重读会看到赢家写入的状态（伪命中），故不可用重读比对。
+  // pg-mem 已实证支持 UPDATE...RETURNING（命中 rows=[...]，miss rows=[]）。
+  const cas = await db.query(
+    "UPDATE ingest SET state = $1 WHERE id = $2 AND state = $3 RETURNING id",
     [next, ingestId, i.state],
   );
-  // 重读比对确认 CAS 命中（不依赖 rowCount——ContentDb port 契约只保证 rows）：
-  // 未命中说明状态被他人先改，state != next
-  const chk = await db.query("SELECT state FROM ingest WHERE id = $1", [ingestId]);
-  if (String(chk.rows[0]?.state) !== next) throw new Error("INVALID_TRANSITION");
+  if (cas.rows.length === 0) throw new Error("INVALID_TRANSITION");
 
   const reviewId = randomUUID();
 ```
 
 （删除原 `const reviewId = \`r${Date.now()}\`;`——同毫秒可碰撞。）
 
-Step 1 测试块再追加一个 CAS SQL 语义测试（直接验证条件 UPDATE 不命中时状态不变）：
+Step 1 测试块再追加一个 CAS SQL 语义测试（直接验证 RETURNING 命中/未命中行为）：
 
 ```ts
-it("CAS 语义：条件 UPDATE 状态不匹配时不修改（fold wave 2 codex P2）", async () => {
+it("CAS 语义：RETURNING 命中返行、未命中返空且不改状态（fold wave 3）", async () => {
   const db = setup();
   await seedIngest(db, {
     id: "i1",
@@ -312,13 +312,24 @@ it("CAS 语义：条件 UPDATE 状态不匹配时不修改（fold wave 2 codex P
     rawMetadata: "{}",
     state: "pending",
   });
-  await db.query(
-    "UPDATE ingest SET state = $1 WHERE id = $2 AND state = $3",
-    ["approved", "i1", "approved"], // 条件用错误旧状态 → 不命中
+  // 条件用错误旧状态 → miss → RETURNING 空 rows，状态不变
+  const miss = await db.query(
+    "UPDATE ingest SET state = $1 WHERE id = $2 AND state = $3 RETURNING id",
+    ["approved", "i1", "approved"],
   );
-  expect(await ingestState(db, "i1")).toBe("pending"); // 状态未被修改
+  expect(miss.rows.length).toBe(0);
+  expect(await ingestState(db, "i1")).toBe("pending");
+  // 正确旧状态 → 命中 → RETURNING 返行（所有权证明）
+  const hit = await db.query(
+    "UPDATE ingest SET state = $1 WHERE id = $2 AND state = $3 RETURNING id",
+    ["approved", "i1", "pending"],
+  );
+  expect(hit.rows.length).toBe(1);
+  expect(await ingestState(db, "i1")).toBe("approved");
 });
 ```
+
+（此用例为 SQL 语义守护：pg-mem 3.0.14 实测支持 UPDATE...RETURNING——主窗口 2026-08-04 已运行时实证。若未来 pg-mem 升级破坏该行为，此测试 RED 即暴露。）
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -345,7 +356,7 @@ git commit -m "feat(content-backend): 状态机 transition 合法性校验"
 
 **Interfaces:**
 - Consumes: Task 1 `ingestTransitionAndAudit(..., reason?)`；Task 2 `INVALID_TRANSITION` 错误
-- Produces: `POST /admin/ingest/:id/{action}` 接受 form 字段 `reason`（可选，≤1000 字符）；409 `errBody("INVALID_TRANSITION", ...)`；400 `errBody("REASON_TOO_LONG", ...)`；operator 角色可操作
+- Produces: `POST /admin/ingest/:id/{action}` 接受 form 字段 `reason`（可选，≤1000 字符）；409/400 返自包含 HTML partial（spec §4 定形：400=可重试表单+回填+返回链接，409=当前状态+返回链接；404 保持 JSON errBody=M2b fix #2 先例）；operator 角色可操作
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1405,13 +1416,14 @@ import { createAuditSink } from "../../src/audit/audit-sink.js";
 import { rmSync, readFileSync } from "node:fs";
 
 let app: any, db: any;
-const auditPath = ".tmp-audit-acceptance.jsonl";
-// track id 每次运行唯一：vitest retry / 上次异常退出不撞 tracks.track_id 主键、
-// 不残留 audit 事件（fold wave 2 codex P2）
+// RUN=本次运行标识：隔离 audit 文件名（并行进程不互踩）；
+// track id 的随机后缀在每个用例内部生成（vitest retry 同模块复用 RUN，
+// 用例级随机才能保证 attempt 间不撞 tracks.track_id 主键）——fold wave 3 codex r3 P2
 const RUN = Math.random().toString(36).slice(2, 8);
+const auditPath = `.tmp-audit-acceptance-${RUN}.jsonl`;
 
 beforeAll(async () => {
-  rmSync(auditPath, { force: true }); // 清前次残留（fold wave 2 codex P2）
+  rmSync(auditPath, { force: true }); // 清前次残留
   db = createTestDb();
   app = await buildOpsApp({
     db,
@@ -1446,7 +1458,7 @@ const META = {
 
 describe("审核 UI 验收全链路", () => {
   it("ingest → 队列可见 → 详情试听 → operator approve → tracks 可见", async () => {
-    const trackId = `self:acc1-${RUN}`;
+    const trackId = `self:acc1-${Math.random().toString(36).slice(2, 8)}`; // 每 attempt 唯一
     const adminCookie = await login("dev-admin");
     const ing = await app.inject({
       method: "POST",
@@ -1488,7 +1500,7 @@ describe("审核 UI 验收全链路", () => {
   });
 
   it("approve 后 revoke → tracks 消失 + 审核历史含理由（独立种子，fold codex P2-3）", async () => {
-    const trackId = `self:acc2-${RUN}`;
+    const trackId = `self:acc2-${Math.random().toString(36).slice(2, 8)}`; // 每 attempt 唯一
     const adminCookie = await login("dev-admin");
     const ing = await app.inject({
       method: "POST",
@@ -1527,7 +1539,7 @@ describe("审核 UI 验收全链路", () => {
   });
 
   it("audit JSONL 含 provision/revoke 事件（独立种子 + 按 target 过滤，fold codex P2-3）", async () => {
-    const trackId = `self:acc3-${RUN}`;
+    const trackId = `self:acc3-${Math.random().toString(36).slice(2, 8)}`; // 每 attempt 唯一
     const adminCookie = await login("dev-admin");
     const ing = await app.inject({
       method: "POST",
@@ -1572,7 +1584,7 @@ Expected: tsc exit 0。
 
 - [ ] **Step 4: CLI 试听接线手动验证（spec known hole 8 承接项，fold wave 2 Eng NEW-5）**
 
-本地有 pg 环境时执行一次并记入 ledger（无 pg 环境则记「环境不具备，known hole 8 保持」）：
+本地有 pg 环境时执行一次，并把验证结果记入 **SDD 阶段进度 ledger**（`.superpowers/sdd/<task 目录>/progress.md`，SDD 执行段开始时建立，沿用 J1/M3 SDD 先例；fold wave 3 codex r3 P2：原表述未定义 ledger）；无 pg 环境则在 ledger 记「环境不具备，known hole 8 保持」：
 
 ```bash
 # 启动 App2（默认连 postgres://localhost:5432/agentos_content，需先建库跑 migrations）
@@ -1607,6 +1619,15 @@ git commit -m "test(content-backend): 审核 UI sim e2e 验收与 README 使用�
 ```
 
 ---
+
+## Fold 记录（plan v4，2026-08-04 fold wave 3：第三轮 scoped re-review 收敛——Eng 5/5 CLOSED + codex 6/8 RESOLVED，CAS 竞态两路独立收敛）
+
+| 来源 | finding | 处置 |
+|---|---|---|
+| codex r3 P1 × Eng NEW-6（两路独立收敛） | CAS 重读比对对同动作并发有伪不变量（miss 方重读看到赢家状态误判命中） | fold 终局：`UPDATE...RETURNING id` + rows.length 判定所有权（rows-only 契约安全；pg-mem 支持已运行时实证：命中 rows=[...]，miss rows=[]）；CAS 语义测试升级验证命中/未命中两分支；spec §3.5 同步定局并删 rowCount 残留措辞 |
+| codex r3 P2（RUN retry 隔离不完整） | RUN 模块级常量，vitest retry 复用同值仍撞主键 | fold：track id 改每用例 attempt 内随机生成；RUN 仅用于 audit 文件名隔离并行进程 |
+| codex r3 P2（T3 Interfaces 散文 stale） | 仍写 409/400 返 errBody | fold：Interfaces 改 HTML partial 定形描述，与 spec §4 一致 |
+| codex r3 P2（ledger 未定义） | T7 手动验证「记入 ledger」无承接实体 | fold：明确为 SDD 阶段进度 ledger（.superpowers/sdd/<task 目录>/progress.md，J1/M3 先例） |
 
 ## Fold 记录（plan v3，2026-08-04 fold wave 2：scoped re-review 收敛——Eng 7/8 CLOSED + codex 11/13 RESOLVED，余下全 fold）
 
@@ -1646,9 +1667,10 @@ git commit -m "test(content-backend): 审核 UI sim e2e 验收与 README 使用�
 | codex P2-5 | migration fallback 伪造 journal | fold：T1 移除手写 fallback，失败即停报告 |
 | codex P2-7 | XSS 无回归测试 | fold：T6 加 eta autoEscape 回归测试（eta 4.x autoEscape 默认开已实证）+ spec §5 #10/#11 |
 
-## Self-Review 记录（v3）
+## Self-Review 记录（v4）
 
-- **wave 2 增量核验**：responseHandling 三页齐（queue/tracks/detail）；错误 partial 自包含可操作（400 重试/409 返回）；CAS 重读比对契约安全；解析器无=分支空串；T3 commit stage 完整；T4/T6 import 含 renderTransitionError；XSS 四字符锁定；T7 retry 隔离（RUN 后缀+audit 清理）；T7 手动验证承接 known hole 8。
-- **Spec 覆盖**：§3.1 页面交互→T5/T6（队列 5 列齐+LIMIT）；§3.2 试听→T4（含 CLI 接线+T7 手动验证）；§3.3 角色门→T3；§3.4 reason→T1/T3/T6；§3.5 状态机防御（含 CAS 重读）→T2/T3；§3.6 数据流→T1-T7；§4 错误处理表（含 §4.1 responseHandling + 自包含 partial 形状）→T2/T3/T5/T6；§5 测试矩阵 11 项→T1-T7 逐项对应；§6 验收→T7；§9 known holes 6/7/8 对应 T2/T3/T4 边界。
+- **wave 3 增量核验**：CAS=RETURNING 所有权判定（命中/miss 两分支测试守护，pg-mem 实证支持）；spec §3.5 与 plan CAS 语义一致（rowCount 措辞已删）；T7 track id 每 attempt 随机+audit 文件按 RUN 隔离；T3 Interfaces 与 spec §4 错误响应定形一致；T7 手动验证 ledger 落点明确。
+- **wave 2 增量核验**：responseHandling 三页齐（queue/tracks/detail）；错误 partial 自包含可操作（400 重试/409 返回）；解析器无=分支空串；T3 commit stage 完整；T4/T6 import 含 renderTransitionError；XSS 四字符锁定；T7 retry 隔离（RUN 后缀+audit 清理）；T7 手动验证承接 known hole 8。
+- **Spec 覆盖**：§3.1 页面交互→T5/T6（队列 5 列齐+LIMIT）；§3.2 试听→T4（含 CLI 接线+T7 手动验证）；§3.3 角色门→T3；§3.4 reason→T1/T3/T6；§3.5 状态机防御（含 CAS RETURNING）→T2/T3；§3.6 数据流→T1-T7；§4 错误处理表（含 §4.1 responseHandling + 自包含 partial 形状）→T2/T3/T5/T6；§5 测试矩阵 11 项→T1-T7 逐项对应；§6 验收→T7；§9 known holes 6/7/8 对应 T2/T3/T4 边界。
 - **Placeholder scan**：无 TBD/TODO；每步含代码或命令+预期。
 - **类型一致性**：`transition(db, ingestId, action, actor, reason?)` / `ingestTransitionAndAudit(db, auditSink, ingestId, action, actor, reason?)` 全 plan 一致；`renderDetailPage` 入参 T6 定义与消费一致；`renderAudio({url?|notice?})`、`renderTransitionError({message, reason?, retryAction?, backHref?})`、`presignFn?: (key) => Promise<{url: string}>` 各处一致。

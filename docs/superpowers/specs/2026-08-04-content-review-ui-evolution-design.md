@@ -86,7 +86,7 @@
 
 - 已有校验 → 不动；
 - 无校验 → 补合法转换矩阵（pending→approve/reject；approved→revoke；rejected/revoked→resubmit），非法转换抛错，HTTP 层映射 409 错误页。UI 按钮显隐是第一层，状态机校验是防御层，两层都要有。
-- **并发防御（fold codex P1-5）**：状态 UPDATE 必须带旧状态条件（CAS：`UPDATE ingest SET state=$1 WHERE id=$2 AND state=$3`，rowCount=0 → 抛 INVALID_TRANSITION）——先 SELECT 后无条件 UPDATE 存在 TOCTOU（两审核员并发 approve/reject 可致状态/review/tracks 不一致）。review 记录 ID 改用 randomUUID（`r${Date.now()}` 同毫秒可碰撞）。已知边界：ContentDb port 无事务 API（pg-mem 约束），CAS 保证状态转换原子，tracks 投影的失败窗口仅剩"并发双 approve 且 CAS 后 INSERT 前进程崩溃"极端场景。
+- **并发防御（fold codex P1-5；fold wave 3 定局 RETURNING）**：状态 UPDATE 必须带旧状态条件且用 RETURNING 判定所有权：`UPDATE ingest SET state=$1 WHERE id=$2 AND state=$3 RETURNING id`，**rows 为空 → 抛 INVALID_TRANSITION**。先 SELECT 后无条件 UPDATE 存在 TOCTOU（两审核员并发 approve/reject 可致状态/review/tracks 不一致）；RETURNING 的 rows 归属能区分「我的 UPDATE 命中」与「他人先改到同一目标态」——重读比对对同动作并发有伪不变量，已废弃。review 记录 ID 改用 randomUUID（`r${Date.now()}` 同毫秒可碰撞）。已知边界：ContentDb port 无事务 API（pg-mem 约束），CAS 保证状态转换原子，tracks 投影的失败窗口仅剩"并发双 approve 且 CAS 后 INSERT 前进程崩溃"极端场景。
 
 ### 3.6 数据流
 
