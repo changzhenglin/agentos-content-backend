@@ -98,7 +98,7 @@ env：
 | `AUDIT_SINK_PATH` | audit JSONL 路径 | `.audit.jsonl` |
 | `CONTENT_BACKEND_REGION` | backend 自持 region（drm region_restrict 判定） | `cn` |
 | `CONTENT_BACKEND_ADMIN_TOKEN` | admin token（审核 UI 登录） | — |
-| `CONTENT_BACKEND_OPERATOR_TOKEN` | operator token（只读审核队列） | — |
+| `CONTENT_BACKEND_OPERATOR_TOKEN` | operator token（可执行审核操作 approve/reject/revoke） | — |
 | `OPS_PORT` | App2 listen 端口 | `3002` |
 
 ### sim 闭环演示
@@ -142,3 +142,13 @@ pnpm test  # 120/120 PASS（含 sim 闭环 e2e 4 用例：block/allow/region_res
 ```
 
 sim 闭环 e2e 覆盖全链：producer push → App2 接收（mTLS + audience/expiry/actor 校验）→ App1 kind 受 drm-guard 约束（block→403 / allow→200 / region_restrict+X-Region→403）→ audit hash chain（config_apply + tool_call，verifyChain 完整）。
+
+### 审核工作台（2026-08-04 演进）
+
+`/admin/*` 已演进为正式内容审核工作台（spec `docs/superpowers/specs/2026-08-04-content-review-ui-evolution-design.md`）：
+
+- 页面：`/admin/ingests`（待审队列，带导航/空态）/ `/admin/ingest/:id`（详情：全元数据/试听/审核历史/操作区）/ `/admin/tracks`（已发布曲目）
+- 角色：admin+operator 均可审核（approve/reject/revoke，reject/revoke 可选理由 ≤1000 字符）；ingest 登记仍仅 admin
+- 试听：音频存 S3（`audioObjectKey`），详情页懒加载 presign URL（现取现用，受 `S3_*` env 影响）
+- 状态机防御：非法状态转换返 409 INVALID_TRANSITION
+- sim 边界不变：认证为 sim dev token + 内存 session（B3），生产由 M1c OIDC/idP 替换
