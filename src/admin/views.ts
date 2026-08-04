@@ -11,6 +11,7 @@ const TEMPLATES: Record<string, string> = {
   tracks: readFileSync("src/admin/templates/tracks.eta", "utf8"),
   "ingest-detail": readFileSync("src/admin/templates/ingest-detail.eta", "utf8"),
   "ingest-form": readFileSync("src/admin/templates/ingest-form.eta", "utf8"),
+  error: readFileSync("src/admin/templates/error.eta", "utf8"),
 };
 
 function render(name: string, data: object): string {
@@ -26,3 +27,11 @@ export const renderIngestForm = (errs: string[] = []) =>
 // htmx partial：审核动作后原地替换 ingest 行（与 renderIngestDetail 同模板）
 export const renderIngestRow = (ingest: any) =>
   render("ingest-detail", { ingest });
+// 审核操作错误 partial（400/409，htmx swap 进 body；自包含：
+// 400=可重试表单，409=返回链接。eta autoEscape 默认开，reason 回填安全）
+export const renderTransitionError = (data: {
+  message: string;
+  reason?: string;
+  retryAction?: string;
+  backHref?: string;
+}) => render("error", data);

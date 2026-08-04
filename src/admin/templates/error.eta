@@ -1,0 +1,8 @@
+<div class="error"><%= it.message %></div>
+<% if (it.retryAction) { %>
+<form hx-post="<%= it.retryAction %>" hx-target="body" hx-swap="innerHTML">
+<textarea name="reason" maxlength="1000"><%= it.reason != null ? it.reason : "" %></textarea>
+<button type="submit">重试</button>
+</form>
+<% } %>
+<% if (it.backHref) { %><p><a href="<%= it.backHref %>">返回详情</a></p><% } %>

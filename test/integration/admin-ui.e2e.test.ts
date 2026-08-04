@@ -179,4 +179,96 @@ describe("admin UI e2e", () => {
     expect(r.statusCode).toBe(404);
     expect(r.json().error_code).toBe("NOT_FOUND");
   });
+
+  it("operator 可 approve（门放宽 admin→operator）→ 200", async () => {
+    const adminCookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-op", raw_metadata: GOOD, audioObjectKey: "k-op" },
+      headers: { cookie: adminCookie },
+    });
+    const opCookie = await login("dev-op");
+    const r = await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${ing.json().id}/approve`,
+      headers: { cookie: opCookie },
+    });
+    expect(r.statusCode).toBe(200);
+  });
+
+  it("reject 带 reason → review.reason 落库（真实浏览器 + 编码路径，fold codex P1-6）", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-reason", raw_metadata: GOOD },
+      headers: { cookie },
+    });
+    // URLSearchParams 把空格编码为 +（真实浏览器 form 行为）；
+    // 旧解析器只 decodeURIComponent 会落库 "license+unclear"
+    const r = await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${ing.json().id}/reject`,
+      headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+      payload: new URLSearchParams({ reason: "license unclear" }).toString(),
+    });
+    expect(r.statusCode).toBe(200);
+    const { rows } = await db.query(
+      "SELECT reason FROM review WHERE ingest_id = $1",
+      [ing.json().id],
+    );
+    expect(rows[rows.length - 1].reason).toBe("license unclear");
+  });
+
+  it("已 rejected 再 approve → 409 + HTML partial（htmx 可 swap，fold codex P1-2）", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-409", raw_metadata: GOOD },
+      headers: { cookie },
+    });
+    await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${ing.json().id}/reject`,
+      headers: { cookie },
+    });
+    const r = await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${ing.json().id}/approve`,
+      headers: { cookie },
+    });
+    expect(r.statusCode).toBe(409);
+    expect(r.headers["content-type"]).toContain("text/html");
+    expect(r.body).toContain("非法操作");
+    expect(r.body).toContain("rejected"); // 当前状态（fold Eng NEW-3）
+    expect(r.body).toContain("返回详情");
+    expect(r.body).not.toContain("重试"); // 409 状态已变，不提供重试
+  });
+
+  it("reason 超 1000 字符 → 400 + HTML partial 含回填（fold codex P1-2）", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-long", raw_metadata: GOOD },
+      headers: { cookie },
+    });
+    const longReason = "x".repeat(1001);
+    const r = await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${ing.json().id}/reject`,
+      headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+      payload: new URLSearchParams({ reason: longReason }).toString(),
+    });
+    expect(r.statusCode).toBe(400);
+    expect(r.headers["content-type"]).toContain("text/html");
+    expect(r.body).toContain("reason exceeds 1000 chars");
+    expect(r.body).toContain(longReason); // 回填
+    // 自包含可重试表单（fold wave 2 codex P1-2/Eng NEW-4）
+    expect(r.body).toContain(`hx-post="/admin/ingest/${ing.json().id}/reject"`);
+    expect(r.body).toContain("重试");
+    expect(r.body).toContain("返回详情");
+  });
 });

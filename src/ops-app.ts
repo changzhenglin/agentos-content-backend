@@ -31,6 +31,7 @@ import {
   renderTracksList,
   renderIngestDetail,
   renderIngestForm,
+  renderTransitionError,
 } from "./admin/views.js";
 
 export interface TlsOpts {
@@ -222,8 +223,14 @@ export async function buildOpsApp(opts: BuildOpsAppOpts) {
         for (const pair of String(body).split("&")) {
           if (!pair) continue;
           const eq = pair.indexOf("=");
-          const k = decodeURIComponent(eq < 0 ? pair : pair.slice(0, eq));
-          const v = decodeURIComponent(eq < 0 ? "" : pair.slice(eq + 1));
+          const k = decodeURIComponent(
+            (eq < 0 ? pair : pair.slice(0, eq)).replace(/\+/g, " "),
+          );
+          // 无 = 的参数值保持空串（原行为；fold wave 2 codex P2：
+          // 上一版误把值取为参数名本身）
+          const v = decodeURIComponent(
+            (eq < 0 ? "" : pair.slice(eq + 1)).replace(/\+/g, " "),
+          );
           out[k] = v;
         }
         done(null, out);
@@ -345,16 +352,35 @@ export async function buildOpsApp(opts: BuildOpsAppOpts) {
       },
     );
 
-    // approve/reject/revoke 返 HTML partial（hx-swap outerHTML，fold design C1）
-    // reject 显式 route（fold design I2，非 catch-all）
+    // approve/reject/revoke：operator 门放宽（spec D5：admin+operator 可审）；
+    // reason 可选（≤1000 字符）；NOT_FOUND→404 JSON（M2b fix #2 先例保持）；
+    // INVALID_TRANSITION→409 / REASON_TOO_LONG→400 返 HTML partial
+    //（htmx 2.0.4 默认 4xx 不 swap，页面 head responseHandling 配置 T5 加；
+    // fold codex P1-2）。
     const transitionRoute = (action: "approve" | "reject" | "revoke") =>
       app.post(
         `/admin/ingest/:id/${action}`,
-        { preHandler: requireRole("admin") },
+        { preHandler: requireRole("operator") },
         async (req, reply) => {
           const ingestId = (req.params as any).id;
-          // transition 内 ingestId 不存在抛 NOT_FOUND（state-machine.ts），
-          // 此处 catch 转 404（避免 fastify 默认 500，fold fix #2）。
+          const reasonRaw = (req.body as any)?.reason;
+          const reason =
+            typeof reasonRaw === "string" && reasonRaw.length > 0
+              ? reasonRaw
+              : undefined;
+          if (reason && reason.length > 1000) {
+            return reply
+              .code(400)
+              .type("text/html")
+              .send(
+                renderTransitionError({
+                  message: "reason exceeds 1000 chars",
+                  reason, // 回填
+                  retryAction: `/admin/ingest/${ingestId}/${action}`,
+                  backHref: `/admin/ingest/${ingestId}`,
+                }),
+              );
+          }
           let trackId: string | null;
           try {
             ({ trackId } = await ingestTransitionAndAudit(
@@ -363,12 +389,30 @@ export async function buildOpsApp(opts: BuildOpsAppOpts) {
               ingestId,
               action,
               (req as any).user.name,
+              reason,
             ));
           } catch (e: any) {
             if (e?.message === "NOT_FOUND") {
               return reply
                 .code(404)
                 .send(errBody("NOT_FOUND", "ingest not found"));
+            }
+            if (e?.message === "INVALID_TRANSITION") {
+              // 409：带当前状态（spec §4；fold Eng NEW-3），不提供重试（状态已变）
+              const cur = await opts.db.query(
+                "SELECT state FROM ingest WHERE id=$1",
+                [ingestId],
+              );
+              const curState = cur.rows[0] ? String(cur.rows[0].state) : "unknown";
+              return reply
+                .code(409)
+                .type("text/html")
+                .send(
+                  renderTransitionError({
+                    message: `非法操作：当前状态为 ${curState}，不允许 ${action}`,
+                    backHref: `/admin/ingest/${ingestId}`,
+                  }),
+                );
             }
             throw e;
           }
