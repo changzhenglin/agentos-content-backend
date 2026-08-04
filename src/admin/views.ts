@@ -12,6 +12,7 @@ const TEMPLATES: Record<string, string> = {
   "ingest-detail": readFileSync("src/admin/templates/ingest-detail.eta", "utf8"),
   "ingest-form": readFileSync("src/admin/templates/ingest-form.eta", "utf8"),
   error: readFileSync("src/admin/templates/error.eta", "utf8"),
+  audio: readFileSync("src/admin/templates/audio.eta", "utf8"),
 };
 
 function render(name: string, data: object): string {
@@ -35,3 +36,6 @@ export const renderTransitionError = (data: {
   retryAction?: string;
   backHref?: string;
 }) => render("error", data);
+// 试听 partial：有 url 出播放器，否则出提示（无音频/未配置/取失败）
+export const renderAudio = (data: { url?: string; notice?: string }) =>
+  render("audio", data);

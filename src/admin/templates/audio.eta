@@ -1,0 +1,5 @@
+<% if (it.url) { %>
+<audio controls src="<%= it.url %>"></audio>
+<% } else { %>
+<div class="audio-notice"><%= it.notice %></div>
+<% } %>

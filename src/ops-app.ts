@@ -26,11 +26,14 @@ import {
   ingestCreate,
   ingestTransitionAndAudit,
 } from "./admin/ingest.js";
+import { presignUrl } from "./storage/presign.js";
+import { createS3 } from "./storage/s3-client.js";
 import {
   renderLogin,
   renderTracksList,
   renderIngestDetail,
   renderIngestForm,
+  renderAudio,
   renderTransitionError,
 } from "./admin/views.js";
 
@@ -51,6 +54,7 @@ export interface BuildOpsAppOpts {
   expectedSan?: string; // 期望 peer cert SAN（D1 非 CN-only）
   adminToken?: string; // T7 用
   operatorToken?: string;
+  presignFn?: (key: string) => Promise<{ url: string }>; // 试听 presign（CLI 默认 env.s3 构造；未配置则试听区显示提示，不阻塞审核）
 }
 
 function errBody(code: string, message: string) {
@@ -293,6 +297,44 @@ export async function buildOpsApp(opts: BuildOpsAppOpts) {
         return reply.type("text/html").send(renderTracksList(rows));
       },
     );
+    // 试听懒加载：presign 有过期时间，现取现用（spec §3.2）
+    app.get(
+      "/admin/ingest/:id/audio",
+      { preHandler: requireRole("operator") },
+      async (req, reply) => {
+        const { rows } = await opts.db.query(
+          "SELECT audio_object_key FROM ingest WHERE id=$1",
+          [(req.params as any).id],
+        );
+        if (!rows[0]) {
+          return reply
+            .code(404)
+            .send(errBody("NOT_FOUND", "ingest not found"));
+        }
+        const key =
+          rows[0].audio_object_key == null
+            ? null
+            : String(rows[0].audio_object_key);
+        if (!key) {
+          return reply
+            .type("text/html")
+            .send(renderAudio({ notice: "无音频，仅元数据审核" }));
+        }
+        if (!opts.presignFn) {
+          return reply
+            .type("text/html")
+            .send(renderAudio({ notice: "试听未配置" }));
+        }
+        try {
+          const { url } = await opts.presignFn(key);
+          return reply.type("text/html").send(renderAudio({ url }));
+        } catch {
+          return reply
+            .type("text/html")
+            .send(renderAudio({ notice: "试听获取失败，可继续审核" }));
+        }
+      },
+    );
 
     // POST routes
     app.post("/admin/login", async (req, reply) => {
@@ -469,6 +511,12 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       return pool.query(text, params as any[]);
     },
   };
+  const s3 = createS3(
+    env.s3.endpoint,
+    env.s3.region,
+    env.s3.accessKeyId,
+    env.s3.secretAccessKey,
+  );
   const app = await buildOpsApp({
     db,
     auditSink: env.auditSinkPath
@@ -484,6 +532,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     expectedSan: "localhost",
     adminToken: env.adminToken,
     operatorToken: env.operatorToken,
+    presignFn: (key: string) =>
+      presignUrl(s3, env.s3.bucket, key).then((r) => ({ url: r.url })),
   });
   await app.listen({ port: env.opsPort, host: "0.0.0.0" });
   console.log(`ops-app listening :${env.opsPort} (mTLS sim CA)`);

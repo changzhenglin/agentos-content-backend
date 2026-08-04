@@ -20,6 +20,9 @@ beforeAll(async () => {
     auditSink: createAuditSink(auditPath),
     adminToken: "dev-admin",
     operatorToken: "dev-op",
+    presignFn: async (_key: string) => ({
+      url: "https://example.test/audio?X-Amz-Signature=abc123",
+    }),
   });
 });
 afterAll(async () => {
@@ -270,5 +273,112 @@ describe("admin UI e2e", () => {
     expect(r.body).toContain(`hx-post="/admin/ingest/${ing.json().id}/reject"`);
     expect(r.body).toContain("重试");
     expect(r.body).toContain("返回详情");
+  });
+
+  it("试听路由：有音频 → <audio> + presigned URL（注入 presignFn）", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-audio", raw_metadata: GOOD, audioObjectKey: "audio/k1" },
+      headers: { cookie },
+    });
+    const r = await app.inject({
+      method: "GET",
+      url: `/admin/ingest/${ing.json().id}/audio`,
+      headers: { cookie },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.body).toContain("<audio");
+    expect(r.body).toContain("X-Amz-Signature=abc123");
+  });
+
+  it("试听路由：无音频 → 提示仅元数据审核", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-noaudio", raw_metadata: GOOD },
+      headers: { cookie },
+    });
+    const r = await app.inject({
+      method: "GET",
+      url: `/admin/ingest/${ing.json().id}/audio`,
+      headers: { cookie },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.body).toContain("无音频");
+  });
+
+  it("试听路由：presign 失败 → 降级提示不阻塞（catch 分支，fold codex P2-2）", async () => {
+    const failApp = await buildOpsApp({
+      db,
+      adminToken: "dev-admin",
+      operatorToken: "dev-op",
+      presignFn: async () => {
+        throw new Error("s3 down");
+      },
+    });
+    const lr = await failApp.inject({
+      method: "POST",
+      url: "/admin/login",
+      payload: { token: "dev-admin" },
+    });
+    const cookie = Array.isArray(lr.headers["set-cookie"])
+      ? lr.headers["set-cookie"][0]
+      : lr.headers["set-cookie"];
+    const ing = await failApp.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-s3fail", raw_metadata: GOOD, audioObjectKey: "audio/kf" },
+      headers: { cookie },
+    });
+    const r = await failApp.inject({
+      method: "GET",
+      url: `/admin/ingest/${ing.json().id}/audio`,
+      headers: { cookie },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.body).toContain("试听获取失败");
+    await failApp.close();
+  });
+
+  it("试听路由：未登录 → 401；不存在 → 404；未配置 → 提示", async () => {
+    const r1 = await app.inject({ method: "GET", url: "/admin/ingest/i-x/audio" });
+    expect(r1.statusCode).toBe(401);
+    const cookie = await login("dev-op");
+    const r2 = await app.inject({
+      method: "GET",
+      url: "/admin/ingest/ing_nonexistent_audio/audio",
+      headers: { cookie },
+    });
+    expect(r2.statusCode).toBe(404);
+    const app2 = await buildOpsApp({
+      db,
+      adminToken: "dev-admin",
+      operatorToken: "dev-op",
+    });
+    const lr = await app2.inject({
+      method: "POST",
+      url: "/admin/login",
+      payload: { token: "dev-admin" },
+    });
+    const cookie2 = Array.isArray(lr.headers["set-cookie"])
+      ? lr.headers["set-cookie"][0]
+      : lr.headers["set-cookie"];
+    const ing = await app2.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-nos3", raw_metadata: GOOD, audioObjectKey: "audio/k9" },
+      headers: { cookie: cookie2 },
+    });
+    const a = await app2.inject({
+      method: "GET",
+      url: `/admin/ingest/${ing.json().id}/audio`,
+      headers: { cookie: cookie2 },
+    });
+    expect(a.statusCode).toBe(200);
+    expect(a.body).toContain("试听未配置");
+    await app2.close();
   });
 });
