@@ -9,6 +9,7 @@ const eta = new Eta({ cache: false });
 const TEMPLATES: Record<string, string> = {
   login: readFileSync("src/admin/templates/login.eta", "utf8"),
   tracks: readFileSync("src/admin/templates/tracks.eta", "utf8"),
+  queue: readFileSync("src/admin/templates/queue.eta", "utf8"),
   "ingest-detail": readFileSync("src/admin/templates/ingest-detail.eta", "utf8"),
   "ingest-form": readFileSync("src/admin/templates/ingest-form.eta", "utf8"),
   error: readFileSync("src/admin/templates/error.eta", "utf8"),
@@ -21,6 +22,16 @@ function render(name: string, data: object): string {
 
 export const renderLogin = () => render("login", {});
 export const renderTracksList = (tracks: any[]) => render("tracks", { tracks });
+export const renderQueuePage = (
+  items: {
+    id: string;
+    track_id: string;
+    state: string;
+    title: string;
+    artist: string;
+    created_at: string;
+  }[],
+) => render("queue", { items });
 export const renderIngestDetail = (ingest: any) =>
   render("ingest-detail", { ingest });
 export const renderIngestForm = (errs: string[] = []) =>

@@ -381,4 +381,64 @@ describe("admin UI e2e", () => {
     expect(a.body).toContain("试听未配置");
     await app2.close();
   });
+
+  it("队列页：自建条目 → 导航/链接/标题/艺人/徽标/空态文案齐（fold Eng I3/codex P1-4/P2-4）", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: {
+        track_id: "self:t-queue",
+        raw_metadata: { ...GOOD, title: "QueueSong", artist: "QueueArtist" },
+      },
+      headers: { cookie },
+    });
+    const r = await app.inject({
+      method: "GET",
+      url: "/admin/ingests",
+      headers: { cookie },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.body).toContain("待审核");
+    expect(r.body).toContain("已发布曲目");
+    expect(r.body).toContain(`/admin/ingest/${ing.json().id}`);
+    expect(r.body).toContain("QueueSong");
+    expect(r.body).toContain("QueueArtist");
+    expect(r.body).toContain("responseHandling"); // htmx 4xx swap 配置在 head（fold codex P1-2）
+  });
+
+  it("队列页空态（无 pending）", async () => {
+    const emptyApp = await buildOpsApp({
+      db: createTestDb(),
+      adminToken: "dev-admin",
+      operatorToken: "dev-op",
+    });
+    const lr = await emptyApp.inject({
+      method: "POST",
+      url: "/admin/login",
+      payload: { token: "dev-admin" },
+    });
+    const cookie = Array.isArray(lr.headers["set-cookie"])
+      ? lr.headers["set-cookie"][0]
+      : lr.headers["set-cookie"];
+    const r = await emptyApp.inject({
+      method: "GET",
+      url: "/admin/ingests",
+      headers: { cookie },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.body).toContain("无待审核 ingest");
+    await emptyApp.close();
+  });
+
+  it("tracks 页含布局导航", async () => {
+    const cookie = await login("dev-admin");
+    const r = await app.inject({
+      method: "GET",
+      url: "/admin/tracks",
+      headers: { cookie },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.body).toContain("待审核");
+  });
 });

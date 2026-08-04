@@ -31,6 +31,7 @@ import { createS3 } from "./storage/s3-client.js";
 import {
   renderLogin,
   renderTracksList,
+  renderQueuePage,
   renderIngestDetail,
   renderIngestForm,
   renderAudio,
@@ -250,19 +251,28 @@ export async function buildOpsApp(opts: BuildOpsAppOpts) {
       { preHandler: requireRole("operator") },
       async (_req, reply) => {
         const { rows } = await opts.db.query(
-          "SELECT id, track_id, state FROM ingest WHERE state='pending' ORDER BY created_at",
+          "SELECT id, track_id, state, raw_metadata, created_at FROM ingest WHERE state='pending' ORDER BY created_at LIMIT 100",
         );
-        const items = rows.map((r: any) => ({
-          id: String(r.id),
-          track_id: String(r.track_id),
-          state: String(r.state),
-        }));
-        // pending queue：完整 HTML 页（含 htmx script，fold design C3），每行一个 ingest-detail partial
-        const table = items
-          .map((i: any) => renderIngestDetail(i))
-          .join("");
-        const html = `<!doctype html><html><head><meta charset="utf-8"><script src="/public/htmx.min.js"></script></head><body><h1>待审核 ingest</h1><table>${table}</table></body></html>`;
-        return reply.type("text/html").send(html);
+        const items = rows.map((r: any) => {
+          let title = "";
+          let artist = "";
+          try {
+            const meta = JSON.parse(String(r.raw_metadata ?? "{}"));
+            title = meta.title != null ? String(meta.title) : "";
+            artist = meta.artist != null ? String(meta.artist) : "";
+          } catch {
+            // raw_metadata 异常不阻塞队列渲染
+          }
+          return {
+            id: String(r.id),
+            track_id: String(r.track_id),
+            state: String(r.state),
+            title,
+            artist,
+            created_at: String(r.created_at ?? ""),
+          };
+        });
+        return reply.type("text/html").send(renderQueuePage(items));
       },
     );
     app.get(
