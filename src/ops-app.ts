@@ -31,10 +31,10 @@ import { createS3 } from "./storage/s3-client.js";
 import {
   renderLogin,
   renderTracksList,
-  renderQueuePage,
-  renderIngestDetail,
   renderIngestForm,
   renderAudio,
+  renderQueuePage,
+  renderDetailPage,
   renderTransitionError,
 } from "./admin/views.js";
 
@@ -60,6 +60,32 @@ export interface BuildOpsAppOpts {
 
 function errBody(code: string, message: string) {
   return { error_code: code, message };
+}
+
+async function loadDetail(db: ContentDb, ingestId: string) {
+  const { rows } = await db.query(
+    "SELECT id, track_id, state, raw_metadata, created_at FROM ingest WHERE id=$1",
+    [ingestId],
+  );
+  if (!rows[0]) return null;
+  const hist = await db.query(
+    "SELECT actor, action, reason, at FROM review WHERE ingest_id=$1 ORDER BY at",
+    [ingestId],
+  );
+  return {
+    ingest: {
+      id: String(rows[0].id),
+      track_id: String(rows[0].track_id),
+      state: String(rows[0].state),
+      meta: JSON.parse(String(rows[0].raw_metadata)) as Record<string, unknown>,
+    },
+    history: hist.rows.map((h: any) => ({
+      actor: String(h.actor),
+      action: String(h.action),
+      reason: h.reason == null ? null : String(h.reason),
+      at: String(h.at ?? ""),
+    })),
+  };
 }
 
 export async function buildOpsApp(opts: BuildOpsAppOpts) {
@@ -279,22 +305,13 @@ export async function buildOpsApp(opts: BuildOpsAppOpts) {
       "/admin/ingest/:id",
       { preHandler: requireRole("operator") },
       async (req, reply) => {
-        const { rows } = await opts.db.query(
-          "SELECT id, track_id, state FROM ingest WHERE id=$1",
-          [(req.params as any).id],
-        );
-        if (!rows[0]) {
+        const detail = await loadDetail(opts.db, (req.params as any).id);
+        if (!detail) {
           return reply
             .code(404)
             .send({ error_code: "NOT_FOUND", message: "ingest not found" });
         }
-        return reply.type("text/html").send(
-          renderIngestDetail({
-            id: String(rows[0].id),
-            track_id: String(rows[0].track_id),
-            state: String(rows[0].state),
-          }),
-        );
+        return reply.type("text/html").send(renderDetailPage(detail));
       },
     );
     app.get(
@@ -468,19 +485,13 @@ export async function buildOpsApp(opts: BuildOpsAppOpts) {
             }
             throw e;
           }
-          const state =
-            action === "approve"
-              ? "approved"
-              : action === "reject"
-                ? "rejected"
-                : "revoked";
-          return reply.type("text/html").send(
-            renderIngestDetail({
-              id: ingestId,
-              track_id: trackId ?? "",
-              state,
-            }),
-          );
+          const detail = await loadDetail(opts.db, ingestId);
+          if (!detail) {
+            return reply
+              .code(404)
+              .send(errBody("NOT_FOUND", "ingest not found"));
+          }
+          return reply.type("text/html").send(renderDetailPage(detail));
         },
       );
     transitionRoute("approve");

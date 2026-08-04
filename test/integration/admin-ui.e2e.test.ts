@@ -441,4 +441,123 @@ describe("admin UI e2e", () => {
     expect(r.statusCode).toBe(200);
     expect(r.body).toContain("待审核");
   });
+
+  const FULL_META = {
+    title: "Full",
+    artist: "Meta",
+    album: "Al",
+    durationMs: 3000,
+    coverUrl: "http://cover/x.png",
+    format: "mp3",
+    bitrate: 320000,
+    isrc: "USRC17607839",
+    license: "CC-BY",
+    regionPolicy: "cn",
+  };
+
+  it("详情页渲染全元数据 + 试听懒加载区 + reason 输入", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-detail", raw_metadata: FULL_META, audioObjectKey: "audio/kd" },
+      headers: { cookie },
+    });
+    const r = await app.inject({
+      method: "GET",
+      url: `/admin/ingest/${ing.json().id}`,
+      headers: { cookie },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.body).toContain("Full");
+    expect(r.body).toContain("CC-BY");
+    expect(r.body).toContain("USRC17607839");
+    expect(r.body).toContain(`hx-get="/admin/ingest/${ing.json().id}/audio"`);
+    expect(r.body).toContain("textarea");
+    expect(r.body).toContain("approve");
+    expect(r.body).toContain("reject");
+    // 详情页是审核操作发生的页面，必须带 4xx swap 配置
+    //（fold wave 2 Eng NEW-1/codex P1-1：首轮 fold 漏了此页）
+    expect(r.body).toContain("responseHandling");
+  });
+
+  it("详情页 approved 状态显示 revoke、隐藏 approve", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-app", raw_metadata: GOOD },
+      headers: { cookie },
+    });
+    await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${ing.json().id}/approve`,
+      headers: { cookie },
+    });
+    const r = await app.inject({
+      method: "GET",
+      url: `/admin/ingest/${ing.json().id}`,
+      headers: { cookie },
+    });
+    expect(r.body).toContain("revoke");
+    // 断言 approve 按钮不存在（历史区 <td>approve</td> 含 ">approve<" 子串，
+    // 不能拿它断言按钮隐藏——fold Eng I2）
+    expect(r.body).not.toContain(`hx-post="/admin/ingest/${ing.json().id}/approve"`);
+    expect(r.body).toContain("已审核");
+  });
+
+  it("详情页审核历史含 actor/action/reason", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-hist", raw_metadata: GOOD },
+      headers: { cookie },
+    });
+    await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${ing.json().id}/reject`,
+      headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+      payload: new URLSearchParams({ reason: "history check" }).toString(),
+    });
+    const r = await app.inject({
+      method: "GET",
+      url: `/admin/ingest/${ing.json().id}`,
+      headers: { cookie },
+    });
+    expect(r.body).toContain("reject");
+    expect(r.body).toContain("history check");
+  });
+
+  it("reason/元数据 XSS：eta autoEscape 回归（fold codex P2-7）", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: {
+        track_id: "self:t-xss",
+        raw_metadata: { ...GOOD, title: '<img src=x onerror=alert(1)>' },
+      },
+      headers: { cookie },
+    });
+    await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${ing.json().id}/reject`,
+      headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+      // 覆盖 < > " & 四类字符（fold wave 2 codex P2：首轮只锁 < >）
+      payload: new URLSearchParams({ reason: '"><script>alert(1)</script> & "quoted"' }).toString(),
+    });
+    const r = await app.inject({
+      method: "GET",
+      url: `/admin/ingest/${ing.json().id}`,
+      headers: { cookie },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.body).not.toContain("<script>alert(1)</script>");
+    expect(r.body).not.toContain("<img src=x");
+    expect(r.body).toContain("&lt;script&gt;"); // eta 4.x autoEscape 默认开，锁定防回归
+    expect(r.body).toContain("&lt;img");
+    expect(r.body).toContain("&amp;"); // & 转义锁定
+    expect(r.body).toContain("&quot;"); // 引号转义锁定
+  });
 });
