@@ -276,7 +276,7 @@ const ALLOWED: Record<string, ReviewAction[]> = {
 };
 ```
 
-transition 内 `if (!i) throw new Error("NOT_FOUND");` 之后加矩阵校验；并把原无条件 UPDATE 改为 **CAS（带旧状态条件）+ rowCount 校验**，reviewId 改 UUID（fold codex P1-5）：
+transition 内 `if (!i) throw new Error("NOT_FOUND");` 之后加矩阵校验；并把原无条件 UPDATE 改为 **CAS（带旧状态条件）+ 重读比对**，reviewId 改 UUID（fold codex P1-5；rowCount 改重读——ContentDb 契约只保证 rows 不保证 rowCount，fold wave 2 codex P2）：
 
 ```ts
   if (!ALLOWED[i.state]?.includes(action)) {
@@ -285,18 +285,40 @@ transition 内 `if (!i) throw new Error("NOT_FOUND");` 之后加矩阵校验；�
 
   const next = NEXT_STATE[action];
 
-  // CAS：带旧状态条件，并发 approve/reject 只有一个成功；
-  // rowCount=0 = 状态已被他人先改 → INVALID_TRANSITION
-  const upd = await db.query(
+  // CAS：带旧状态条件，并发 approve/reject 只有一个成功（UPDATE 行锁串行化）
+  await db.query(
     "UPDATE ingest SET state = $1 WHERE id = $2 AND state = $3",
     [next, ingestId, i.state],
   );
-  if ((upd as any).rowCount === 0) throw new Error("INVALID_TRANSITION");
+  // 重读比对确认 CAS 命中（不依赖 rowCount——ContentDb port 契约只保证 rows）：
+  // 未命中说明状态被他人先改，state != next
+  const chk = await db.query("SELECT state FROM ingest WHERE id = $1", [ingestId]);
+  if (String(chk.rows[0]?.state) !== next) throw new Error("INVALID_TRANSITION");
 
   const reviewId = randomUUID();
 ```
 
-（删除原 `const reviewId = \`r${Date.now()}\`;`——同毫秒可碰撞。注：pg-mem 单线程无法触发真并发，rowCount 分支是真实 PG 并发下的防御；若 pg-mem 的 UPDATE 结果 rowCount 为 undefined，实现时改用「UPDATE 后重读 state 比对」兜底，记入 ledger。）
+（删除原 `const reviewId = \`r${Date.now()}\`;`——同毫秒可碰撞。）
+
+Step 1 测试块再追加一个 CAS SQL 语义测试（直接验证条件 UPDATE 不命中时状态不变）：
+
+```ts
+it("CAS 语义：条件 UPDATE 状态不匹配时不修改（fold wave 2 codex P2）", async () => {
+  const db = setup();
+  await seedIngest(db, {
+    id: "i1",
+    trackId: "self:t1",
+    source: "self_hosted",
+    rawMetadata: "{}",
+    state: "pending",
+  });
+  await db.query(
+    "UPDATE ingest SET state = $1 WHERE id = $2 AND state = $3",
+    ["approved", "i1", "approved"], // 条件用错误旧状态 → 不命中
+  );
+  expect(await ingestState(db, "i1")).toBe("pending"); // 状态未被修改
+});
+```
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -392,6 +414,9 @@ it("已 rejected 再 approve → 409 + HTML partial（htmx 可 swap，fold codex
   expect(r.statusCode).toBe(409);
   expect(r.headers["content-type"]).toContain("text/html");
   expect(r.body).toContain("非法操作");
+  expect(r.body).toContain("rejected"); // 当前状态（fold Eng NEW-3）
+  expect(r.body).toContain("返回详情");
+  expect(r.body).not.toContain("重试"); // 409 状态已变，不提供重试
 });
 
 it("reason 超 1000 字符 → 400 + HTML partial 含回填（fold codex P1-2）", async () => {
@@ -413,6 +438,10 @@ it("reason 超 1000 字符 → 400 + HTML partial 含回填（fold codex P1-2）
   expect(r.headers["content-type"]).toContain("text/html");
   expect(r.body).toContain("reason exceeds 1000 chars");
   expect(r.body).toContain(longReason); // 回填
+  // 自包含可重试表单（fold wave 2 codex P1-2/Eng NEW-4）
+  expect(r.body).toContain(`hx-post="/admin/ingest/${ing.json().id}/reject"`);
+  expect(r.body).toContain("重试");
+  expect(r.body).toContain("返回详情");
 });
 ```
 
@@ -432,28 +461,39 @@ Expected: "operator 可 approve" FAIL（403）；"409" FAIL（200 静默转换�
           const k = decodeURIComponent(
             (eq < 0 ? pair : pair.slice(0, eq)).replace(/\+/g, " "),
           );
+          // 无 = 的参数值保持空串（原行为；fold wave 2 codex P2：
+          // 上一版误把值取为参数名本身）
           const v = decodeURIComponent(
-            (eq < 0 ? pair : pair.slice(eq + 1)).replace(/\+/g, " "),
+            (eq < 0 ? "" : pair.slice(eq + 1)).replace(/\+/g, " "),
           );
           out[k] = v;
         }
 ```
 
-**3b. 错误 partial 模板**：`src/admin/templates/error.eta` 新建：
+**3b. 错误 partial 模板（自包含可操作形状，fold wave 2 codex P1-2/Eng NEW-4）**：`src/admin/templates/error.eta` 新建——400 带可重试表单（textarea 回填+重试按钮），409 只带返回链接（状态已变重试无意义），均含返回详情链接：
 
 ```eta
 <div class="error"><%= it.message %></div>
-<% if (it.reason != null) { %>
-<textarea name="reason" maxlength="1000"><%= it.reason %></textarea>
+<% if (it.retryAction) { %>
+<form hx-post="<%= it.retryAction %>" hx-target="body" hx-swap="innerHTML">
+<textarea name="reason" maxlength="1000"><%= it.reason != null ? it.reason : "" %></textarea>
+<button type="submit">重试</button>
+</form>
 <% } %>
+<% if (it.backHref) { %><p><a href="<%= it.backHref %>">返回详情</a></p><% } %>
 ```
 
 `src/admin/views.ts` TEMPLATES 加 `error: readFileSync("src/admin/templates/error.eta", "utf8"),`，导出：
 
 ```ts
-// 审核操作错误 partial（400/409，htmx swap；eta autoEscape 默认开，reason 回填安全）
-export const renderTransitionError = (data: { message: string; reason?: string }) =>
-  render("error", data);
+// 审核操作错误 partial（400/409，htmx swap 进 body；自包含：
+// 400=可重试表单，409=返回链接。eta autoEscape 默认开，reason 回填安全）
+export const renderTransitionError = (data: {
+  message: string;
+  reason?: string;
+  retryAction?: string;
+  backHref?: string;
+}) => render("error", data);
 ```
 
 **3c. transitionRoute** 整段替换为：
@@ -482,7 +522,9 @@ export const renderTransitionError = (data: { message: string; reason?: string }
               .send(
                 renderTransitionError({
                   message: "reason exceeds 1000 chars",
-                  reason,
+                  reason, // 回填
+                  retryAction: `/admin/ingest/${ingestId}/${action}`,
+                  backHref: `/admin/ingest/${ingestId}`,
                 }),
               );
           }
@@ -503,12 +545,19 @@ export const renderTransitionError = (data: { message: string; reason?: string }
                 .send(errBody("NOT_FOUND", "ingest not found"));
             }
             if (e?.message === "INVALID_TRANSITION") {
+              // 409：带当前状态（spec §4；fold Eng NEW-3），不提供重试（状态已变）
+              const cur = await opts.db.query(
+                "SELECT state FROM ingest WHERE id=$1",
+                [ingestId],
+              );
+              const curState = cur.rows[0] ? String(cur.rows[0].state) : "unknown";
               return reply
                 .code(409)
                 .type("text/html")
                 .send(
                   renderTransitionError({
-                    message: "非法操作：当前状态不允许该动作",
+                    message: `非法操作：当前状态为 ${curState}，不允许 ${action}`,
+                    backHref: `/admin/ingest/${ingestId}`,
                   }),
                 );
             }
@@ -549,9 +598,11 @@ Expected: 全量零回归。
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/ops-app.ts test/integration/admin-ui.e2e.test.ts
+git add src/ops-app.ts src/admin/views.ts src/admin/templates/error.eta test/integration/admin-ui.e2e.test.ts
 git commit -m "feat(content-backend): 审核操作门放宽 operator + reason/409/400 路由接线"
 ```
+
+（git add 清单含本 task 新建的 error.eta 与改动的 views.ts——fold wave 2 codex P1-3：漏 stage 会导致按 plan 提交后运行时 ENOENT。）
 
 ---
 
@@ -736,10 +787,11 @@ import {
   renderIngestDetail,
   renderIngestForm,
   renderAudio,
+  renderTransitionError,
 } from "./admin/views.js";
 ```
 
-（原 views import 块替换为上面这段。）
+（原 views import 块替换为上面这段；renderTransitionError 为 T3 已加项，替换块必须保留——fold wave 2 Eng NEW-2。）
 
 `BuildOpsAppOpts` 加一个可选字段（注入式，对齐 index.ts PresignFn 模式）：
 
@@ -1075,6 +1127,9 @@ it("详情页渲染全元数据 + 试听懒加载区 + reason 输入", async () 
   expect(r.body).toContain("textarea");
   expect(r.body).toContain("approve");
   expect(r.body).toContain("reject");
+  // 详情页是审核操作发生的页面，必须带 4xx swap 配置
+  //（fold wave 2 Eng NEW-1/codex P1-1：首轮 fold 漏了此页）
+  expect(r.body).toContain("responseHandling");
 });
 
 it("详情页 approved 状态显示 revoke、隐藏 approve", async () => {
@@ -1140,7 +1195,8 @@ it("reason/元数据 XSS：eta autoEscape 回归（fold codex P2-7）", async ()
     method: "POST",
     url: `/admin/ingest/${ing.json().id}/reject`,
     headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
-    payload: new URLSearchParams({ reason: '"><script>alert(1)</script>' }).toString(),
+    // 覆盖 < > " & 四类字符（fold wave 2 codex P2：首轮只锁 < >）
+    payload: new URLSearchParams({ reason: '"><script>alert(1)</script> & "quoted"' }).toString(),
   });
   const r = await app.inject({
     method: "GET",
@@ -1152,6 +1208,8 @@ it("reason/元数据 XSS：eta autoEscape 回归（fold codex P2-7）", async ()
   expect(r.body).not.toContain("<img src=x");
   expect(r.body).toContain("&lt;script&gt;"); // eta 4.x autoEscape 默认开，锁定防回归
   expect(r.body).toContain("&lt;img");
+  expect(r.body).toContain("&amp;"); // & 转义锁定
+  expect(r.body).toContain("&quot;"); // 引号转义锁定
 });
 ```
 
@@ -1165,7 +1223,7 @@ Expected: 新用例 FAIL（详情页当前是行 partial，无元数据/试听�
 `src/admin/templates/detail.eta` 新建：
 
 ```eta
-<!doctype html><html><head><meta charset="utf-8"><script src="/public/htmx.min.js"></script></head><body>
+<!doctype html><html><head><meta charset="utf-8"><script src="/public/htmx.min.js"></script><script>htmx.config.responseHandling = [{ code: ".*", swap: true }];</script></head><body>
 <nav><a href="/admin/ingests">待审核</a> | <a href="/admin/tracks">已发布曲目</a></nav>
 <h1>审核详情 <%= it.ingest.track_id %></h1>
 <div id="detail-main">
@@ -1240,10 +1298,11 @@ import {
   renderAudio,
   renderQueuePage,
   renderDetailPage,
+  renderTransitionError,
 } from "./admin/views.js";
 ```
 
-（移除 renderIngestDetail 导入。）
+（移除 renderIngestDetail 导入；renderTransitionError 为 T3 已加项必须保留——fold wave 2 Eng NEW-2。）
 
 加一个详情数据组装 helper（放在 buildOpsApp 外、errBody 附近）：
 
@@ -1347,8 +1406,12 @@ import { rmSync, readFileSync } from "node:fs";
 
 let app: any, db: any;
 const auditPath = ".tmp-audit-acceptance.jsonl";
+// track id 每次运行唯一：vitest retry / 上次异常退出不撞 tracks.track_id 主键、
+// 不残留 audit 事件（fold wave 2 codex P2）
+const RUN = Math.random().toString(36).slice(2, 8);
 
 beforeAll(async () => {
+  rmSync(auditPath, { force: true }); // 清前次残留（fold wave 2 codex P2）
   db = createTestDb();
   app = await buildOpsApp({
     db,
@@ -1383,11 +1446,12 @@ const META = {
 
 describe("审核 UI 验收全链路", () => {
   it("ingest → 队列可见 → 详情试听 → operator approve → tracks 可见", async () => {
+    const trackId = `self:acc1-${RUN}`;
     const adminCookie = await login("dev-admin");
     const ing = await app.inject({
       method: "POST",
       url: "/admin/ingest",
-      payload: { track_id: "self:acc1", raw_metadata: META, audioObjectKey: "audio/acc1" },
+      payload: { track_id: trackId, raw_metadata: META, audioObjectKey: "audio/acc1" },
       headers: { cookie: adminCookie },
     });
     const id = ing.json().id;
@@ -1397,7 +1461,7 @@ describe("审核 UI 验收全链路", () => {
       url: "/admin/ingests",
       headers: { cookie: adminCookie },
     });
-    expect(queue.body).toContain("self:acc1");
+    expect(queue.body).toContain(trackId);
 
     const audio = await app.inject({
       method: "GET",
@@ -1420,15 +1484,16 @@ describe("审核 UI 验收全链路", () => {
       url: "/admin/tracks",
       headers: { cookie: opCookie },
     });
-    expect(tracks.body).toContain("self:acc1");
+    expect(tracks.body).toContain(trackId);
   });
 
   it("approve 后 revoke → tracks 消失 + 审核历史含理由（独立种子，fold codex P2-3）", async () => {
+    const trackId = `self:acc2-${RUN}`;
     const adminCookie = await login("dev-admin");
     const ing = await app.inject({
       method: "POST",
       url: "/admin/ingest",
-      payload: { track_id: "self:acc2", raw_metadata: { ...META, title: "Acc2" }, audioObjectKey: "audio/acc2" },
+      payload: { track_id: trackId, raw_metadata: { ...META, title: "Acc2" }, audioObjectKey: "audio/acc2" },
       headers: { cookie: adminCookie },
     });
     const id = ing.json().id;
@@ -1450,7 +1515,7 @@ describe("审核 UI 验收全链路", () => {
       url: "/admin/tracks",
       headers: { cookie: adminCookie },
     });
-    expect(tracks.body).not.toContain("self:acc2");
+    expect(tracks.body).not.toContain(trackId);
 
     const detail = await app.inject({
       method: "GET",
@@ -1462,11 +1527,12 @@ describe("审核 UI 验收全链路", () => {
   });
 
   it("audit JSONL 含 provision/revoke 事件（独立种子 + 按 target 过滤，fold codex P2-3）", async () => {
+    const trackId = `self:acc3-${RUN}`;
     const adminCookie = await login("dev-admin");
     const ing = await app.inject({
       method: "POST",
       url: "/admin/ingest",
-      payload: { track_id: "self:acc3", raw_metadata: { ...META, title: "Acc3" } },
+      payload: { track_id: trackId, raw_metadata: { ...META, title: "Acc3" } },
       headers: { cookie: adminCookie },
     });
     await app.inject({
@@ -1482,7 +1548,7 @@ describe("审核 UI 验收全链路", () => {
     const lines = readFileSync(auditPath, "utf8").trim().split("\n");
     const events = lines
       .map((l) => JSON.parse(l))
-      .filter((e) => e.target === "self:acc3");
+      .filter((e) => e.target === trackId);
     expect(events.some((e) => e.eventType === "provision")).toBe(true);
     expect(events.some((e) => e.eventType === "revoke")).toBe(true);
   });
@@ -1504,7 +1570,18 @@ Expected: 全 PASS，零回归。
 Run: `pnpm build`
 Expected: tsc exit 0。
 
-- [ ] **Step 4: README 补审核工作台小节 + 修 stale 描述**
+- [ ] **Step 4: CLI 试听接线手动验证（spec known hole 8 承接项，fold wave 2 Eng NEW-5）**
+
+本地有 pg 环境时执行一次并记入 ledger（无 pg 环境则记「环境不具备，known hole 8 保持」）：
+
+```bash
+# 启动 App2（默认连 postgres://localhost:5432/agentos_content，需先建库跑 migrations）
+pnpm tsx src/ops-app.ts
+```
+
+手动验证项：登录（admin token）→ POST /admin/ingest 建一条带 audioObjectKey 的 ingest → GET 详情页 → 试听区出现 `<audio>`（presign 懒加载成功）或出现「试听获取失败」（S3 未起）——两者之一即证明 CLI 接线生效（不再是「试听未配置」）。
+
+- [ ] **Step 5: README 补审核工作台小节 + 修 stale 描述**
 
 先修 stale 行（fold Eng M5）：README.md 环境变量表约 line 101 `CONTENT_BACKEND_OPERATOR_TOKEN` 描述从「operator token（只读审核队列）」改为「operator token（可执行审核操作 approve/reject/revoke）」。
 
@@ -1522,7 +1599,7 @@ Expected: tsc exit 0。
 - sim 边界不变：认证为 sim dev token + 内存 session（B3），生产由 M1c OIDC/idP 替换
 ```
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add test/integration/review-ui-acceptance.e2e.test.ts README.md
@@ -1530,6 +1607,22 @@ git commit -m "test(content-backend): 审核 UI sim e2e 验收与 README 使用�
 ```
 
 ---
+
+## Fold 记录（plan v3，2026-08-04 fold wave 2：scoped re-review 收敛——Eng 7/8 CLOSED + codex 11/13 RESOLVED，余下全 fold）
+
+| 来源 | finding | 处置 |
+|---|---|---|
+| Eng M1/NEW-1 = codex r2 P1-1 | detail.eta 缺 responseHandling（审核操作就发生在详情页） | fold：detail.eta head 加配置 + T6 测试加锁定断言 |
+| codex r2 P1-2 × Eng NEW-4 | 错误 partial 经 hx-target=body 整页替换后不可操作（裸 textarea 无表单） | fold：error.eta 改自包含形状——400=重试表单（textarea 回填+重试按钮）+返回链接，409=返回链接（状态已变不重试）；T3 测试断言重试表单/返回链接/409 无重试 |
+| Eng NEW-3 | 409 partial 缺当前状态（spec §4 明文） | fold：T3 catch 分支查当前 state 入错误文案 |
+| codex r2 P1-3 | T3 commit 漏 stage error.eta/views.ts | fold：git add 清单补全 + 注记 |
+| Eng NEW-2 | T4/T6 views import 替换块丢 renderTransitionError（照做两次 tsc break） | fold：两处 import 块补名 + 注记 |
+| codex r2 P2（CAS rowCount） | ContentDb 契约只保证 rows，rowCount 是契约外依赖 | fold：CAS 改「UPDATE 后重读比对」（rows-only 契约安全）+ CAS miss SQL 语义测试 |
+| codex r2 P2（解析器无=分支） | fold wave 1 把无 = 参数值误改为参数名本身 | fold：恢复空串行为，保留 + →空格修复 |
+| codex r2 P2（XSS 断言不全） | 只锁 < >，未锁 " & | fold：payload 加引号/&，断言 &quot;/&amp; |
+| codex r2 P2（T7 retry 隔离） | audit 文件未清 + 固定 track id retry 撞主键 | fold：beforeAll rmSync + RUN 随机后缀 |
+| Eng NEW-5 | known hole 8 手动验证项无承接步骤 | fold：T7 加 Step 4 CLI 手动验证（含环境不具备的诚实分支） |
+| codex r2 P2-1（统一错误页） | 仍属明确驳回（404 JSON = M2b fix #2 先例 + 既有测试依赖） | 驳回维持，spec §4 措辞已定形 |
 
 ## Fold 记录（plan v2，2026-08-04：Eng 3I/5M + codex 跨厂商 7P1/6P2 全 fold）
 
@@ -1553,8 +1646,9 @@ git commit -m "test(content-backend): 审核 UI sim e2e 验收与 README 使用�
 | codex P2-5 | migration fallback 伪造 journal | fold：T1 移除手写 fallback，失败即停报告 |
 | codex P2-7 | XSS 无回归测试 | fold：T6 加 eta autoEscape 回归测试（eta 4.x autoEscape 默认开已实证）+ spec §5 #10/#11 |
 
-## Self-Review 记录（v2）
+## Self-Review 记录（v3）
 
-- **Spec 覆盖**：§3.1 页面交互→T5/T6（队列 5 列齐+LIMIT）；§3.2 试听→T4（含 CLI 接线）；§3.3 角色门→T3；§3.4 reason→T1/T3/T6；§3.5 状态机防御（含 CAS）→T2/T3；§3.6 数据流→T1-T7；§4 错误处理表（含 §4.1 responseHandling）→T2/T3/T5；§5 测试矩阵 11 项→T1-T7 逐项对应（1→T5，2→T6，3→T4，4→T3/T7，5→T1/T3/T7，6→T7，7→T3/T4，8→T2/T3，9→T3，10→T6，11→T3）；§6 验收→T7；§9 known holes 6/7/8 对应 T2/T3/T4 边界。
+- **wave 2 增量核验**：responseHandling 三页齐（queue/tracks/detail）；错误 partial 自包含可操作（400 重试/409 返回）；CAS 重读比对契约安全；解析器无=分支空串；T3 commit stage 完整；T4/T6 import 含 renderTransitionError；XSS 四字符锁定；T7 retry 隔离（RUN 后缀+audit 清理）；T7 手动验证承接 known hole 8。
+- **Spec 覆盖**：§3.1 页面交互→T5/T6（队列 5 列齐+LIMIT）；§3.2 试听→T4（含 CLI 接线+T7 手动验证）；§3.3 角色门→T3；§3.4 reason→T1/T3/T6；§3.5 状态机防御（含 CAS 重读）→T2/T3；§3.6 数据流→T1-T7；§4 错误处理表（含 §4.1 responseHandling + 自包含 partial 形状）→T2/T3/T5/T6；§5 测试矩阵 11 项→T1-T7 逐项对应；§6 验收→T7；§9 known holes 6/7/8 对应 T2/T3/T4 边界。
 - **Placeholder scan**：无 TBD/TODO；每步含代码或命令+预期。
-- **类型一致性**：`transition(db, ingestId, action, actor, reason?)` / `ingestTransitionAndAudit(db, auditSink, ingestId, action, actor, reason?)` 全 plan 一致；`renderDetailPage` 入参 T6 定义与消费一致（散文已同步）；`renderAudio({url?|notice?})`、`renderTransitionError({message, reason?})`、`presignFn?: (key) => Promise<{url: string}>` 各处一致。
+- **类型一致性**：`transition(db, ingestId, action, actor, reason?)` / `ingestTransitionAndAudit(db, auditSink, ingestId, action, actor, reason?)` 全 plan 一致；`renderDetailPage` 入参 T6 定义与消费一致；`renderAudio({url?|notice?})`、`renderTransitionError({message, reason?, retryAction?, backHref?})`、`presignFn?: (key) => Promise<{url: string}>` 各处一致。

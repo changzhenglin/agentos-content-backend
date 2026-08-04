@@ -109,8 +109,8 @@
 | 场景 | 行为 |
 |---|---|
 | ingest 不存在 | 404 JSON errBody（现状 NOT_FOUND 语义保持，M2b fix #2 先例） |
-| 非法状态转换（§3.5） | 409 + HTML partial（错误文案 + 当前状态；htmx 4xx 默认不 swap，页面须配 responseHandling，见 §4.1） |
-| reason 超 1000 字符 | 400 + HTML partial（错误文案 + reason 回填） |
+| 非法状态转换（§3.5） | 409 + 自包含 HTML partial：错误文案含**当前状态** + 返回详情链接（状态已变，不提供重试——fold wave 2 定形）；htmx 4xx 默认不 swap，页面须配 responseHandling，见 §4.1 |
+| reason 超 1000 字符 | 400 + 自包含 HTML partial：错误文案 + **可重试表单**（textarea 回填 reason + 重试按钮）+ 返回详情链接 |
 | presign 失败 / 音频加载失败 | 试听区错误提示 / 浏览器原生降级；不阻塞审核操作 |
 | 未登录 | 401 JSON（现状 requireRole 行为，不重定向） |
 | 角色不足 | 403 JSON（现状 requireRole 行为） |
