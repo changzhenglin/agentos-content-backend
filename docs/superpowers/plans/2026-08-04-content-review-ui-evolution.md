@@ -349,7 +349,11 @@ it("transition CAS miss：并发赢家时抛 INVALID_TRANSITION 且无副作用�
       if (text.startsWith("UPDATE ingest") && text.includes("RETURNING id")) {
         await db.query("UPDATE ingest SET state='approved' WHERE id='i1'");
       }
-      return db.query(text, params as any[]);
+      const result = await db.query(text, params as any[]);
+      // fold wave 5 codex r5 P2：剥离 rowCount，只返 ContentDb 契约承诺的 rows
+      //（src/content/db.ts 接口即 `{ rows }`；spec §3.5 rows-only 终局）。
+      // 若实现退回 `cas.rowCount === 0` 判定，此处 rowCount 为 undefined→miss 不检出→不抛错→本用例 RED。
+      return { rows: result.rows };
     },
   };
   await expect(
@@ -1651,6 +1655,12 @@ git commit -m "test(content-backend): 审核 UI sim e2e 验收与 README 使用�
 
 ---
 
+## Fold 记录（plan v6，2026-08-04 fold wave 5：r5 scoped 收敛确认 NEEDS_WORK→1 P2 fold）
+
+| 来源 | finding | 处置 |
+|---|---|---|
+| codex r5 P2（plan:352） | raceDb 原样透传 pg-mem 完整结果（含 rowCount）：实现若退回 `cas.rowCount === 0` 判定，wave 4 race 用例仍全绿——未守护 ContentDb rows-only 契约（r4 P2 fold 只覆盖了「漏/误删判断」回归，未覆盖「退回 rowCount 判定」回归） | fold：raceDb wrapper 剥离 rowCount 只返 `{ rows: result.rows }`——ContentDb 接口（`src/content/db.ts` 返回 `Promise<{ rows }>`）本就只承诺 rows，类型精确匹配；rowCount 判定读 undefined→miss 不检出→不抛 INVALID_TRANSITION→用例 RED；与 wave 3 rows-only 终局决策（spec §3.5 已删 rowCount 措辞）对齐 |
+
 ## Fold 记录（plan v5，2026-08-04 fold wave 4：r4 收敛——Eng READY_FOR_SDD 0 新面 + codex 4/4 RESOLVED + 1 P2 fold）
 
 | 来源 | finding | 处置 |
@@ -1704,8 +1714,9 @@ git commit -m "test(content-backend): 审核 UI sim e2e 验收与 README 使用�
 | codex P2-5 | migration fallback 伪造 journal | fold：T1 移除手写 fallback，失败即停报告 |
 | codex P2-7 | XSS 无回归测试 | fold：T6 加 eta autoEscape 回归测试（eta 4.x autoEscape 默认开已实证）+ spec §5 #10/#11 |
 
-## Self-Review 记录（v5）
+## Self-Review 记录（v6）
 
+- **wave 5 增量核验**：raceDb 剥离 rowCount 只返 rows——transition() 级 race 用例守护范围覆盖「漏/误删 CAS miss 判断」与「退回 rowCount 判定」两种回归；与 ContentDb 接口（`src/content/db.ts` 只承诺 `{ rows }`）及 spec §3.5 rows-only 终局一致。
 - **wave 4 增量核验**：T2 CAS 守护双层——SQL 语义用例（RETURNING 命中/miss）+ transition() 级 race 用例（并发赢家→抛错+零副作用）；实现漏判不再可能全绿。
 - **wave 3 增量核验**：CAS=RETURNING 所有权判定（命中/miss 两分支测试守护，pg-mem 实证支持）；spec §3.5 与 plan CAS 语义一致（rowCount 措辞已删）；T7 track id 每 attempt 随机+audit 文件按 RUN 隔离；T3 Interfaces 与 spec §4 错误响应定形一致；T7 手动验证 ledger 落点明确。
 - **wave 2 增量核验**：responseHandling 三页齐（queue/tracks/detail）；错误 partial 自包含可操作（400 重试/409 返回）；解析器无=分支空串；T3 commit stage 完整；T4/T6 import 含 renderTransitionError；XSS 四字符锁定；T7 retry 隔离（RUN 后缀+audit 清理）；T7 手动验证承接 known hole 8。
