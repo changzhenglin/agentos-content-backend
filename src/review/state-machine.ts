@@ -14,6 +14,7 @@
 // 注入 pg Pool，测试由 pg-mem 注入。参数化 SQL 在 pg-mem 与真实 Postgres 同路径，
 // 安全且可测。语义与 brief 完全一致。
 
+import { randomUUID } from "node:crypto";
 import type { ContentDb } from "../content/db.js";
 
 export type ReviewAction = "approve" | "reject" | "revoke" | "resubmit";
@@ -23,6 +24,14 @@ const NEXT_STATE: Record<ReviewAction, string> = {
   reject: "rejected",
   revoke: "revoked",
   resubmit: "pending",
+};
+
+// 合法转换矩阵（spec §3.5 防御层；UI 按钮显隐是第一层）
+const ALLOWED: Record<string, ReviewAction[]> = {
+  pending: ["approve", "reject"],
+  approved: ["revoke"],
+  rejected: ["resubmit"],
+  revoked: ["resubmit"],
 };
 
 interface IngestRow {
@@ -62,11 +71,23 @@ export async function transition(
   const i = await fetchIngest(db, ingestId);
   if (!i) throw new Error("NOT_FOUND");
 
+  if (!ALLOWED[i.state]?.includes(action)) {
+    throw new Error("INVALID_TRANSITION");
+  }
+
   const next = NEXT_STATE[action];
 
-  await db.query("UPDATE ingest SET state = $1 WHERE id = $2", [next, ingestId]);
+  // CAS：带旧状态条件，并发 approve/reject 只有一个成功（UPDATE 行锁串行化）。
+  // RETURNING 证明 UPDATE 所有权：命中方得 rows，miss 方得空数组——
+  // 同动作并发下 miss 方重读会看到赢家写入的状态（伪命中），故不可用重读比对。
+  // pg-mem 已实证支持 UPDATE...RETURNING（命中 rows=[...]，miss rows=[]）。
+  const cas = await db.query(
+    "UPDATE ingest SET state = $1 WHERE id = $2 AND state = $3 RETURNING id",
+    [next, ingestId, i.state],
+  );
+  if (cas.rows.length === 0) throw new Error("INVALID_TRANSITION");
 
-  const reviewId = `r${Date.now()}`;
+  const reviewId = randomUUID();
   await db.query(
     "INSERT INTO review (id, ingest_id, actor, action, reason) VALUES ($1,$2,$3,$4,$5)",
     [reviewId, ingestId, actor, action, reason ?? null],
