@@ -9,8 +9,11 @@ const eta = new Eta({ cache: false });
 const TEMPLATES: Record<string, string> = {
   login: readFileSync("src/admin/templates/login.eta", "utf8"),
   tracks: readFileSync("src/admin/templates/tracks.eta", "utf8"),
-  "ingest-detail": readFileSync("src/admin/templates/ingest-detail.eta", "utf8"),
+  queue: readFileSync("src/admin/templates/queue.eta", "utf8"),
+  detail: readFileSync("src/admin/templates/detail.eta", "utf8"),
   "ingest-form": readFileSync("src/admin/templates/ingest-form.eta", "utf8"),
+  error: readFileSync("src/admin/templates/error.eta", "utf8"),
+  audio: readFileSync("src/admin/templates/audio.eta", "utf8"),
 };
 
 function render(name: string, data: object): string {
@@ -19,10 +22,35 @@ function render(name: string, data: object): string {
 
 export const renderLogin = () => render("login", {});
 export const renderTracksList = (tracks: any[]) => render("tracks", { tracks });
-export const renderIngestDetail = (ingest: any) =>
-  render("ingest-detail", { ingest });
+export const renderQueuePage = (
+  items: {
+    id: string;
+    track_id: string;
+    state: string;
+    title: string;
+    artist: string;
+    created_at: string;
+  }[],
+) => render("queue", { items });
+export const renderDetailPage = (data: {
+  ingest: {
+    id: string;
+    track_id: string;
+    state: string;
+    meta: Record<string, unknown>;
+  };
+  history: { actor: string; action: string; reason: string | null; at: string }[];
+}) => render("detail", data);
 export const renderIngestForm = (errs: string[] = []) =>
   render("ingest-form", { errs });
-// htmx partial：审核动作后原地替换 ingest 行（与 renderIngestDetail 同模板）
-export const renderIngestRow = (ingest: any) =>
-  render("ingest-detail", { ingest });
+// 审核操作错误 partial（400/409，htmx swap 进 body；自包含：
+// 400=可重试表单，409=返回链接。eta autoEscape 默认开，reason 回填安全）
+export const renderTransitionError = (data: {
+  message: string;
+  reason?: string;
+  retryAction?: string;
+  backHref?: string;
+}) => render("error", data);
+// 试听 partial：有 url 出播放器，否则出提示（无音频/未配置/取失败）
+export const renderAudio = (data: { url?: string; notice?: string }) =>
+  render("audio", data);

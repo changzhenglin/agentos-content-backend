@@ -26,6 +26,7 @@ const REVIEW_DDL = `CREATE TABLE review (
   ingest_id text NOT NULL,
   actor text NOT NULL,
   action text NOT NULL,
+  reason text,
   at timestamp NOT NULL DEFAULT now()
 )`;
 
@@ -191,5 +192,138 @@ describe("review state machine", () => {
     });
     await transition(db, "i1", "resubmit", "user:op");
     expect(await ingestState(db, "i1")).toBe("pending");
+  });
+
+  it("transition with reason records it on review row", async () => {
+    const db = setup();
+    await seedIngest(db, {
+      id: "i1",
+      trackId: "self:t1",
+      source: "self_hosted",
+      rawMetadata: META,
+      audioObjectKey: "obj/key",
+      state: "pending",
+    });
+    await transition(db, "i1", "reject", "user:admin", "license unclear");
+    const { rows } = await db.query(
+      "SELECT reason FROM review WHERE ingest_id = 'i1'",
+    );
+    expect(rows[0].reason).toBe("license unclear");
+  });
+
+  it("transition without reason stores NULL", async () => {
+    const db = setup();
+    await seedIngest(db, {
+      id: "i1",
+      trackId: "self:t1",
+      source: "self_hosted",
+      rawMetadata: META,
+      audioObjectKey: "obj/key",
+      state: "pending",
+    });
+    await transition(db, "i1", "approve", "user:admin");
+    const { rows } = await db.query(
+      "SELECT reason FROM review WHERE ingest_id = 'i1'",
+    );
+    expect(rows[0].reason).toBeNull();
+  });
+
+  it("approve on rejected ingest throws INVALID_TRANSITION", async () => {
+    const db = setup();
+    await seedIngest(db, {
+      id: "i1",
+      trackId: "self:t1",
+      source: "self_hosted",
+      rawMetadata: "{}",
+      state: "rejected",
+    });
+    await expect(
+      transition(db, "i1", "approve", "user:admin"),
+    ).rejects.toThrow("INVALID_TRANSITION");
+    expect(await ingestState(db, "i1")).toBe("rejected");
+  });
+
+  it("revoke on pending ingest throws INVALID_TRANSITION", async () => {
+    const db = setup();
+    await seedIngest(db, {
+      id: "i1",
+      trackId: "self:t1",
+      source: "self_hosted",
+      rawMetadata: "{}",
+      state: "pending",
+    });
+    await expect(
+      transition(db, "i1", "revoke", "user:admin"),
+    ).rejects.toThrow("INVALID_TRANSITION");
+  });
+
+  it("resubmit on approved ingest throws INVALID_TRANSITION", async () => {
+    const db = setup();
+    await seedIngest(db, {
+      id: "i1",
+      trackId: "self:t1",
+      source: "self_hosted",
+      rawMetadata: "{}",
+      state: "approved",
+    });
+    await expect(
+      transition(db, "i1", "resubmit", "user:op"),
+    ).rejects.toThrow("INVALID_TRANSITION");
+  });
+
+  it("CAS 语义：RETURNING 命中返行、未命中返空且不改状态（fold wave 3）", async () => {
+    const db = setup();
+    await seedIngest(db, {
+      id: "i1",
+      trackId: "self:t1",
+      source: "self_hosted",
+      rawMetadata: "{}",
+      state: "pending",
+    });
+    // 条件用错误旧状态 → miss → RETURNING 空 rows，状态不变
+    const miss = await db.query(
+      "UPDATE ingest SET state = $1 WHERE id = $2 AND state = $3 RETURNING id",
+      ["approved", "i1", "approved"],
+    );
+    expect(miss.rows.length).toBe(0);
+    expect(await ingestState(db, "i1")).toBe("pending");
+    // 正确旧状态 → 命中 → RETURNING 返行（所有权证明）
+    const hit = await db.query(
+      "UPDATE ingest SET state = $1 WHERE id = $2 AND state = $3 RETURNING id",
+      ["approved", "i1", "pending"],
+    );
+    expect(hit.rows.length).toBe(1);
+    expect(await ingestState(db, "i1")).toBe("approved");
+  });
+
+  it("transition CAS miss：并发赢家时抛 INVALID_TRANSITION 且无副作用（fold wave 4 codex r4 P2）", async () => {
+    const db = setup();
+    await seedIngest(db, {
+      id: "i1",
+      trackId: "self:t1",
+      source: "self_hosted",
+      rawMetadata: META,
+      state: "pending",
+    });
+    // 模拟并发赢家：CAS UPDATE 执行前，另一审核员先 approve（state 变为 approved）
+    const raceDb: ContentDb = {
+      async query(text: string, params?: unknown[]) {
+        if (text.startsWith("UPDATE ingest") && text.includes("RETURNING id")) {
+          await db.query("UPDATE ingest SET state='approved' WHERE id='i1'");
+        }
+        const result = await db.query(text, params as any[]);
+        // fold wave 5 codex r5 P2：剥离 rowCount，只返 ContentDb 契约承诺的 rows
+        //（src/content/db.ts 接口即 `{ rows }`；spec §3.5 rows-only 终局）。
+        // 若实现退回 `cas.rowCount === 0` 判定，此处 rowCount 为 undefined→miss 不检出→不抛错→本用例 RED。
+        return { rows: result.rows };
+      },
+    };
+    await expect(
+      transition(raceDb, "i1", "approve", "user:admin"),
+    ).rejects.toThrow("INVALID_TRANSITION");
+    // 无副作用：miss 方不写 review 记录、不做 tracks 投影
+    const reviews = await db.query("SELECT count(*)::int AS c FROM review");
+    expect(Number(reviews.rows[0].c)).toBe(0);
+    expect(await tracksCount(db)).toBe(0);
   });
 });

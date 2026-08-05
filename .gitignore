@@ -6,3 +6,6 @@ dist/
 
 # mock-policy-producer CLI cert cache
 .sim-certs/
+
+# SDD workspace（ledger/brief/report，git-ignored scratch；plan T7 fold wave 3 先例）
+.superpowers/

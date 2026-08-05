@@ -26,11 +26,16 @@ import {
   ingestCreate,
   ingestTransitionAndAudit,
 } from "./admin/ingest.js";
+import { presignUrl } from "./storage/presign.js";
+import { createS3 } from "./storage/s3-client.js";
 import {
   renderLogin,
   renderTracksList,
-  renderIngestDetail,
   renderIngestForm,
+  renderAudio,
+  renderQueuePage,
+  renderDetailPage,
+  renderTransitionError,
 } from "./admin/views.js";
 
 export interface TlsOpts {
@@ -50,10 +55,37 @@ export interface BuildOpsAppOpts {
   expectedSan?: string; // 期望 peer cert SAN（D1 非 CN-only）
   adminToken?: string; // T7 用
   operatorToken?: string;
+  presignFn?: (key: string) => Promise<{ url: string }>; // 试听 presign（CLI 默认 env.s3 构造；未配置则试听区显示提示，不阻塞审核）
 }
 
 function errBody(code: string, message: string) {
   return { error_code: code, message };
+}
+
+async function loadDetail(db: ContentDb, ingestId: string) {
+  const { rows } = await db.query(
+    "SELECT id, track_id, state, raw_metadata, created_at FROM ingest WHERE id=$1",
+    [ingestId],
+  );
+  if (!rows[0]) return null;
+  const hist = await db.query(
+    "SELECT actor, action, reason, at FROM review WHERE ingest_id=$1 ORDER BY at",
+    [ingestId],
+  );
+  return {
+    ingest: {
+      id: String(rows[0].id),
+      track_id: String(rows[0].track_id),
+      state: String(rows[0].state),
+      meta: JSON.parse(String(rows[0].raw_metadata)) as Record<string, unknown>,
+    },
+    history: hist.rows.map((h: any) => ({
+      actor: String(h.actor),
+      action: String(h.action),
+      reason: h.reason == null ? null : String(h.reason),
+      at: String(h.at ?? ""),
+    })),
+  };
 }
 
 export async function buildOpsApp(opts: BuildOpsAppOpts) {
@@ -222,8 +254,14 @@ export async function buildOpsApp(opts: BuildOpsAppOpts) {
         for (const pair of String(body).split("&")) {
           if (!pair) continue;
           const eq = pair.indexOf("=");
-          const k = decodeURIComponent(eq < 0 ? pair : pair.slice(0, eq));
-          const v = decodeURIComponent(eq < 0 ? "" : pair.slice(eq + 1));
+          const k = decodeURIComponent(
+            (eq < 0 ? pair : pair.slice(0, eq)).replace(/\+/g, " "),
+          );
+          // 无 = 的参数值保持空串（原行为；fold wave 2 codex P2：
+          // 上一版误把值取为参数名本身）
+          const v = decodeURIComponent(
+            (eq < 0 ? "" : pair.slice(eq + 1)).replace(/\+/g, " "),
+          );
           out[k] = v;
         }
         done(null, out);
@@ -239,41 +277,41 @@ export async function buildOpsApp(opts: BuildOpsAppOpts) {
       { preHandler: requireRole("operator") },
       async (_req, reply) => {
         const { rows } = await opts.db.query(
-          "SELECT id, track_id, state FROM ingest WHERE state='pending' ORDER BY created_at",
+          "SELECT id, track_id, state, raw_metadata, created_at FROM ingest WHERE state='pending' ORDER BY created_at LIMIT 100",
         );
-        const items = rows.map((r: any) => ({
-          id: String(r.id),
-          track_id: String(r.track_id),
-          state: String(r.state),
-        }));
-        // pending queue：完整 HTML 页（含 htmx script，fold design C3），每行一个 ingest-detail partial
-        const table = items
-          .map((i: any) => renderIngestDetail(i))
-          .join("");
-        const html = `<!doctype html><html><head><meta charset="utf-8"><script src="/public/htmx.min.js"></script></head><body><h1>待审核 ingest</h1><table>${table}</table></body></html>`;
-        return reply.type("text/html").send(html);
+        const items = rows.map((r: any) => {
+          let title = "";
+          let artist = "";
+          try {
+            const meta = JSON.parse(String(r.raw_metadata ?? "{}"));
+            title = meta.title != null ? String(meta.title) : "";
+            artist = meta.artist != null ? String(meta.artist) : "";
+          } catch {
+            // raw_metadata 异常不阻塞队列渲染
+          }
+          return {
+            id: String(r.id),
+            track_id: String(r.track_id),
+            state: String(r.state),
+            title,
+            artist,
+            created_at: String(r.created_at ?? ""),
+          };
+        });
+        return reply.type("text/html").send(renderQueuePage(items));
       },
     );
     app.get(
       "/admin/ingest/:id",
       { preHandler: requireRole("operator") },
       async (req, reply) => {
-        const { rows } = await opts.db.query(
-          "SELECT id, track_id, state FROM ingest WHERE id=$1",
-          [(req.params as any).id],
-        );
-        if (!rows[0]) {
+        const detail = await loadDetail(opts.db, (req.params as any).id);
+        if (!detail) {
           return reply
             .code(404)
             .send({ error_code: "NOT_FOUND", message: "ingest not found" });
         }
-        return reply.type("text/html").send(
-          renderIngestDetail({
-            id: String(rows[0].id),
-            track_id: String(rows[0].track_id),
-            state: String(rows[0].state),
-          }),
-        );
+        return reply.type("text/html").send(renderDetailPage(detail));
       },
     );
     app.get(
@@ -284,6 +322,44 @@ export async function buildOpsApp(opts: BuildOpsAppOpts) {
           "SELECT track_id, title, artist FROM tracks",
         );
         return reply.type("text/html").send(renderTracksList(rows));
+      },
+    );
+    // 试听懒加载：presign 有过期时间，现取现用（spec §3.2）
+    app.get(
+      "/admin/ingest/:id/audio",
+      { preHandler: requireRole("operator") },
+      async (req, reply) => {
+        const { rows } = await opts.db.query(
+          "SELECT audio_object_key FROM ingest WHERE id=$1",
+          [(req.params as any).id],
+        );
+        if (!rows[0]) {
+          return reply
+            .code(404)
+            .send(errBody("NOT_FOUND", "ingest not found"));
+        }
+        const key =
+          rows[0].audio_object_key == null
+            ? null
+            : String(rows[0].audio_object_key);
+        if (!key) {
+          return reply
+            .type("text/html")
+            .send(renderAudio({ notice: "无音频，仅元数据审核" }));
+        }
+        if (!opts.presignFn) {
+          return reply
+            .type("text/html")
+            .send(renderAudio({ notice: "试听未配置" }));
+        }
+        try {
+          const { url } = await opts.presignFn(key);
+          return reply.type("text/html").send(renderAudio({ url }));
+        } catch {
+          return reply
+            .type("text/html")
+            .send(renderAudio({ notice: "试听获取失败，可继续审核" }));
+        }
       },
     );
 
@@ -345,16 +421,35 @@ export async function buildOpsApp(opts: BuildOpsAppOpts) {
       },
     );
 
-    // approve/reject/revoke 返 HTML partial（hx-swap outerHTML，fold design C1）
-    // reject 显式 route（fold design I2，非 catch-all）
+    // approve/reject/revoke：operator 门放宽（spec D5：admin+operator 可审）；
+    // reason 可选（≤1000 字符）；NOT_FOUND→404 JSON（M2b fix #2 先例保持）；
+    // INVALID_TRANSITION→409 / REASON_TOO_LONG→400 返 HTML partial
+    //（htmx 2.0.4 默认 4xx 不 swap，页面 head responseHandling 配置 T5 加；
+    // fold codex P1-2）。
     const transitionRoute = (action: "approve" | "reject" | "revoke") =>
       app.post(
         `/admin/ingest/:id/${action}`,
-        { preHandler: requireRole("admin") },
+        { preHandler: requireRole("operator") },
         async (req, reply) => {
           const ingestId = (req.params as any).id;
-          // transition 内 ingestId 不存在抛 NOT_FOUND（state-machine.ts），
-          // 此处 catch 转 404（避免 fastify 默认 500，fold fix #2）。
+          const reasonRaw = (req.body as any)?.reason;
+          const reason =
+            typeof reasonRaw === "string" && reasonRaw.length > 0
+              ? reasonRaw
+              : undefined;
+          if (reason && reason.length > 1000) {
+            return reply
+              .code(400)
+              .type("text/html")
+              .send(
+                renderTransitionError({
+                  message: "reason exceeds 1000 chars",
+                  reason, // 回填
+                  retryAction: `/admin/ingest/${ingestId}/${action}`,
+                  backHref: `/admin/ingest/${ingestId}`,
+                }),
+              );
+          }
           let trackId: string | null;
           try {
             ({ trackId } = await ingestTransitionAndAudit(
@@ -363,6 +458,7 @@ export async function buildOpsApp(opts: BuildOpsAppOpts) {
               ingestId,
               action,
               (req as any).user.name,
+              reason,
             ));
           } catch (e: any) {
             if (e?.message === "NOT_FOUND") {
@@ -370,21 +466,32 @@ export async function buildOpsApp(opts: BuildOpsAppOpts) {
                 .code(404)
                 .send(errBody("NOT_FOUND", "ingest not found"));
             }
+            if (e?.message === "INVALID_TRANSITION") {
+              // 409：带当前状态（spec §4；fold Eng NEW-3），不提供重试（状态已变）
+              const cur = await opts.db.query(
+                "SELECT state FROM ingest WHERE id=$1",
+                [ingestId],
+              );
+              const curState = cur.rows[0] ? String(cur.rows[0].state) : "unknown";
+              return reply
+                .code(409)
+                .type("text/html")
+                .send(
+                  renderTransitionError({
+                    message: `非法操作：当前状态为 ${curState}，不允许 ${action}`,
+                    backHref: `/admin/ingest/${ingestId}`,
+                  }),
+                );
+            }
             throw e;
           }
-          const state =
-            action === "approve"
-              ? "approved"
-              : action === "reject"
-                ? "rejected"
-                : "revoked";
-          return reply.type("text/html").send(
-            renderIngestDetail({
-              id: ingestId,
-              track_id: trackId ?? "",
-              state,
-            }),
-          );
+          const detail = await loadDetail(opts.db, ingestId);
+          if (!detail) {
+            return reply
+              .code(404)
+              .send(errBody("NOT_FOUND", "ingest not found"));
+          }
+          return reply.type("text/html").send(renderDetailPage(detail));
         },
       );
     transitionRoute("approve");
@@ -425,6 +532,12 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       return pool.query(text, params as any[]);
     },
   };
+  const s3 = createS3(
+    env.s3.endpoint,
+    env.s3.region,
+    env.s3.accessKeyId,
+    env.s3.secretAccessKey,
+  );
   const app = await buildOpsApp({
     db,
     auditSink: env.auditSinkPath
@@ -440,6 +553,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     expectedSan: "localhost",
     adminToken: env.adminToken,
     operatorToken: env.operatorToken,
+    presignFn: (key: string) =>
+      presignUrl(s3, env.s3.bucket, key).then((r) => ({ url: r.url })),
   });
   await app.listen({ port: env.opsPort, host: "0.0.0.0" });
   console.log(`ops-app listening :${env.opsPort} (mTLS sim CA)`);

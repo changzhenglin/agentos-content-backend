@@ -23,6 +23,7 @@ export const review = pgTable("review", {
   action: text("action", {
     enum: ["approve", "reject", "revoke", "resubmit"],
   }).notNull(),
+  reason: text("reason"),
   at: timestamp("at").defaultNow().notNull(),
 });
 

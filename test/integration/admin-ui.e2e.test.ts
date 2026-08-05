@@ -20,6 +20,9 @@ beforeAll(async () => {
     auditSink: createAuditSink(auditPath),
     adminToken: "dev-admin",
     operatorToken: "dev-op",
+    presignFn: async (_key: string) => ({
+      url: "https://example.test/audio?X-Amz-Signature=abc123",
+    }),
   });
 });
 afterAll(async () => {
@@ -178,5 +181,383 @@ describe("admin UI e2e", () => {
     });
     expect(r.statusCode).toBe(404);
     expect(r.json().error_code).toBe("NOT_FOUND");
+  });
+
+  it("operator 可 approve（门放宽 admin→operator）→ 200", async () => {
+    const adminCookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-op", raw_metadata: GOOD, audioObjectKey: "k-op" },
+      headers: { cookie: adminCookie },
+    });
+    const opCookie = await login("dev-op");
+    const r = await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${ing.json().id}/approve`,
+      headers: { cookie: opCookie },
+    });
+    expect(r.statusCode).toBe(200);
+  });
+
+  it("reject 带 reason → review.reason 落库（真实浏览器 + 编码路径，fold codex P1-6）", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-reason", raw_metadata: GOOD },
+      headers: { cookie },
+    });
+    // URLSearchParams 把空格编码为 +（真实浏览器 form 行为）；
+    // 旧解析器只 decodeURIComponent 会落库 "license+unclear"
+    const r = await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${ing.json().id}/reject`,
+      headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+      payload: new URLSearchParams({ reason: "license unclear" }).toString(),
+    });
+    expect(r.statusCode).toBe(200);
+    const { rows } = await db.query(
+      "SELECT reason FROM review WHERE ingest_id = $1",
+      [ing.json().id],
+    );
+    expect(rows[rows.length - 1].reason).toBe("license unclear");
+  });
+
+  it("已 rejected 再 approve → 409 + HTML partial（htmx 可 swap，fold codex P1-2）", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-409", raw_metadata: GOOD },
+      headers: { cookie },
+    });
+    await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${ing.json().id}/reject`,
+      headers: { cookie },
+    });
+    const r = await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${ing.json().id}/approve`,
+      headers: { cookie },
+    });
+    expect(r.statusCode).toBe(409);
+    expect(r.headers["content-type"]).toContain("text/html");
+    expect(r.body).toContain("非法操作");
+    expect(r.body).toContain("rejected"); // 当前状态（fold Eng NEW-3）
+    expect(r.body).toContain("返回详情");
+    expect(r.body).not.toContain("重试"); // 409 状态已变，不提供重试
+  });
+
+  it("reason 超 1000 字符 → 400 + HTML partial 含回填（fold codex P1-2）", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-long", raw_metadata: GOOD },
+      headers: { cookie },
+    });
+    const longReason = "x".repeat(1001);
+    const r = await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${ing.json().id}/reject`,
+      headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+      payload: new URLSearchParams({ reason: longReason }).toString(),
+    });
+    expect(r.statusCode).toBe(400);
+    expect(r.headers["content-type"]).toContain("text/html");
+    expect(r.body).toContain("reason exceeds 1000 chars");
+    expect(r.body).toContain(longReason); // 回填
+    // 自包含可重试表单（fold wave 2 codex P1-2/Eng NEW-4）
+    expect(r.body).toContain(`hx-post="/admin/ingest/${ing.json().id}/reject"`);
+    expect(r.body).toContain("重试");
+    expect(r.body).toContain("返回详情");
+  });
+
+  it("试听路由：有音频 → <audio> + presigned URL（注入 presignFn）", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-audio", raw_metadata: GOOD, audioObjectKey: "audio/k1" },
+      headers: { cookie },
+    });
+    const r = await app.inject({
+      method: "GET",
+      url: `/admin/ingest/${ing.json().id}/audio`,
+      headers: { cookie },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.body).toContain("<audio");
+    expect(r.body).toContain("X-Amz-Signature=abc123");
+  });
+
+  it("试听路由：无音频 → 提示仅元数据审核", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-noaudio", raw_metadata: GOOD },
+      headers: { cookie },
+    });
+    const r = await app.inject({
+      method: "GET",
+      url: `/admin/ingest/${ing.json().id}/audio`,
+      headers: { cookie },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.body).toContain("无音频");
+  });
+
+  it("试听路由：presign 失败 → 降级提示不阻塞（catch 分支，fold codex P2-2）", async () => {
+    const failApp = await buildOpsApp({
+      db,
+      adminToken: "dev-admin",
+      operatorToken: "dev-op",
+      presignFn: async () => {
+        throw new Error("s3 down");
+      },
+    });
+    const lr = await failApp.inject({
+      method: "POST",
+      url: "/admin/login",
+      payload: { token: "dev-admin" },
+    });
+    const cookie = Array.isArray(lr.headers["set-cookie"])
+      ? lr.headers["set-cookie"][0]
+      : lr.headers["set-cookie"];
+    const ing = await failApp.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-s3fail", raw_metadata: GOOD, audioObjectKey: "audio/kf" },
+      headers: { cookie },
+    });
+    const r = await failApp.inject({
+      method: "GET",
+      url: `/admin/ingest/${ing.json().id}/audio`,
+      headers: { cookie },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.body).toContain("试听获取失败");
+    await failApp.close();
+  });
+
+  it("试听路由：未登录 → 401；不存在 → 404；未配置 → 提示", async () => {
+    const r1 = await app.inject({ method: "GET", url: "/admin/ingest/i-x/audio" });
+    expect(r1.statusCode).toBe(401);
+    const cookie = await login("dev-op");
+    const r2 = await app.inject({
+      method: "GET",
+      url: "/admin/ingest/ing_nonexistent_audio/audio",
+      headers: { cookie },
+    });
+    expect(r2.statusCode).toBe(404);
+    const app2 = await buildOpsApp({
+      db,
+      adminToken: "dev-admin",
+      operatorToken: "dev-op",
+    });
+    const lr = await app2.inject({
+      method: "POST",
+      url: "/admin/login",
+      payload: { token: "dev-admin" },
+    });
+    const cookie2 = Array.isArray(lr.headers["set-cookie"])
+      ? lr.headers["set-cookie"][0]
+      : lr.headers["set-cookie"];
+    const ing = await app2.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-nos3", raw_metadata: GOOD, audioObjectKey: "audio/k9" },
+      headers: { cookie: cookie2 },
+    });
+    const a = await app2.inject({
+      method: "GET",
+      url: `/admin/ingest/${ing.json().id}/audio`,
+      headers: { cookie: cookie2 },
+    });
+    expect(a.statusCode).toBe(200);
+    expect(a.body).toContain("试听未配置");
+    await app2.close();
+  });
+
+  it("队列页：自建条目 → 导航/链接/标题/艺人/徽标/空态文案齐（fold Eng I3/codex P1-4/P2-4）", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: {
+        track_id: "self:t-queue",
+        raw_metadata: { ...GOOD, title: "QueueSong", artist: "QueueArtist" },
+      },
+      headers: { cookie },
+    });
+    const r = await app.inject({
+      method: "GET",
+      url: "/admin/ingests",
+      headers: { cookie },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.body).toContain("待审核");
+    expect(r.body).toContain("已发布曲目");
+    expect(r.body).toContain(`/admin/ingest/${ing.json().id}`);
+    expect(r.body).toContain("QueueSong");
+    expect(r.body).toContain("QueueArtist");
+    expect(r.body).toContain("responseHandling"); // htmx 4xx swap 配置在 head（fold codex P1-2）
+  });
+
+  it("队列页空态（无 pending）", async () => {
+    const emptyApp = await buildOpsApp({
+      db: createTestDb(),
+      adminToken: "dev-admin",
+      operatorToken: "dev-op",
+    });
+    const lr = await emptyApp.inject({
+      method: "POST",
+      url: "/admin/login",
+      payload: { token: "dev-admin" },
+    });
+    const cookie = Array.isArray(lr.headers["set-cookie"])
+      ? lr.headers["set-cookie"][0]
+      : lr.headers["set-cookie"];
+    const r = await emptyApp.inject({
+      method: "GET",
+      url: "/admin/ingests",
+      headers: { cookie },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.body).toContain("无待审核 ingest");
+    await emptyApp.close();
+  });
+
+  it("tracks 页含布局导航", async () => {
+    const cookie = await login("dev-admin");
+    const r = await app.inject({
+      method: "GET",
+      url: "/admin/tracks",
+      headers: { cookie },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.body).toContain("待审核");
+  });
+
+  const FULL_META = {
+    title: "Full",
+    artist: "Meta",
+    album: "Al",
+    durationMs: 3000,
+    coverUrl: "http://cover/x.png",
+    format: "mp3",
+    bitrate: 320000,
+    isrc: "USRC17607839",
+    license: "CC-BY",
+    regionPolicy: "cn",
+  };
+
+  it("详情页渲染全元数据 + 试听懒加载区 + reason 输入", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-detail", raw_metadata: FULL_META, audioObjectKey: "audio/kd" },
+      headers: { cookie },
+    });
+    const r = await app.inject({
+      method: "GET",
+      url: `/admin/ingest/${ing.json().id}`,
+      headers: { cookie },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.body).toContain("Full");
+    expect(r.body).toContain("CC-BY");
+    expect(r.body).toContain("USRC17607839");
+    expect(r.body).toContain(`hx-get="/admin/ingest/${ing.json().id}/audio"`);
+    expect(r.body).toContain("textarea");
+    expect(r.body).toContain("approve");
+    expect(r.body).toContain("reject");
+    // 详情页是审核操作发生的页面，必须带 4xx swap 配置
+    //（fold wave 2 Eng NEW-1/codex P1-1：首轮 fold 漏了此页）
+    expect(r.body).toContain("responseHandling");
+  });
+
+  it("详情页 approved 状态显示 revoke、隐藏 approve", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-app", raw_metadata: GOOD },
+      headers: { cookie },
+    });
+    await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${ing.json().id}/approve`,
+      headers: { cookie },
+    });
+    const r = await app.inject({
+      method: "GET",
+      url: `/admin/ingest/${ing.json().id}`,
+      headers: { cookie },
+    });
+    expect(r.body).toContain("revoke");
+    // 断言 approve 按钮不存在（历史区 <td>approve</td> 含 ">approve<" 子串，
+    // 不能拿它断言按钮隐藏——fold Eng I2）
+    expect(r.body).not.toContain(`hx-post="/admin/ingest/${ing.json().id}/approve"`);
+    expect(r.body).toContain("已审核");
+  });
+
+  it("详情页审核历史含 actor/action/reason", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: { track_id: "self:t-hist", raw_metadata: GOOD },
+      headers: { cookie },
+    });
+    await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${ing.json().id}/reject`,
+      headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+      payload: new URLSearchParams({ reason: "history check" }).toString(),
+    });
+    const r = await app.inject({
+      method: "GET",
+      url: `/admin/ingest/${ing.json().id}`,
+      headers: { cookie },
+    });
+    expect(r.body).toContain("reject");
+    expect(r.body).toContain("history check");
+  });
+
+  it("reason/元数据 XSS：eta autoEscape 回归（fold codex P2-7）", async () => {
+    const cookie = await login("dev-admin");
+    const ing = await app.inject({
+      method: "POST",
+      url: "/admin/ingest",
+      payload: {
+        track_id: "self:t-xss",
+        raw_metadata: { ...GOOD, title: '<img src=x onerror=alert(1)>' },
+      },
+      headers: { cookie },
+    });
+    await app.inject({
+      method: "POST",
+      url: `/admin/ingest/${ing.json().id}/reject`,
+      headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+      // 覆盖 < > " & 四类字符（fold wave 2 codex P2：首轮只锁 < >）
+      payload: new URLSearchParams({ reason: '"><script>alert(1)</script> & "quoted"' }).toString(),
+    });
+    const r = await app.inject({
+      method: "GET",
+      url: `/admin/ingest/${ing.json().id}`,
+      headers: { cookie },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.body).not.toContain("<script>alert(1)</script>");
+    expect(r.body).not.toContain("<img src=x");
+    expect(r.body).toContain("&lt;script&gt;"); // eta 4.x autoEscape 默认开，锁定防回归
+    expect(r.body).toContain("&lt;img");
+    expect(r.body).toContain("&amp;"); // & 转义锁定
+    expect(r.body).toContain("&quot;"); // 引号转义锁定
   });
 });

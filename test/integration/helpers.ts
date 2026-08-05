@@ -65,6 +65,7 @@ export const REVIEW_DDL = `CREATE TABLE IF NOT EXISTS review (
   ingest_id text NOT NULL,
   actor text NOT NULL,
   action text NOT NULL,
+  reason text,
   at timestamp NOT NULL DEFAULT now()
 )`;
 
