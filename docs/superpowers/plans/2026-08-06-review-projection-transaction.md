@@ -947,7 +947,7 @@ Expected: 5 passed（Docker 可用时；首次跑含容器启动，记录实际�
 
 - [ ] **Step 3: 全量回归 + tsc**
 
-Run: `pnpm test` → Expected: 298 passed（293 + 本 task 5，Docker 可用时）/ 29 skipped / 4 既有环境失败文件不变（本文件 Docker 不可用时 skip 不入失败集）
+Run: `pnpm test` → Expected: 291 passed（seed 缺席口径：286 + 本 task 5；seed 在场则 298）/ 29 skipped / 4 既有环境失败文件不变（本文件 Docker 不可用时 skip 不入失败集）
 Run: `pnpm build` → Expected: exit 0
 
 - [ ] **Step 4: Commit**
@@ -961,7 +961,7 @@ git commit -m "test(review): 真 pg 并发验收（P1 回归/CAS 竞争零残留
 
 ## 收尾验证（全 task 完成后，归链上 verification-before-completion，非 task）
 
-1. `pnpm test` 全量复跑：298 passed / 29 skipped / 4 既有环境失败集合不变（Docker 可用口径；不可用则 293+5skip 并注明）
+1. `pnpm test` 全量复跑：291 passed（seed 缺席口径；在场则 298）/ 29 skipped / 4 既有环境失败集合不变（Docker 可用口径；不可用则 286+5skip 并注明）；同 commit 基线对比增量必须恰 +5
 2. `pnpm build` exit 0
 3. Surgical scope 核对：`git diff main --stat` 对 File Structure——新增 4（src/db/transaction.ts / test/unit/db-transaction.test.ts / test/unit/review-tx-affinity.test.ts / test/integration/review-projection-tx.e2e.test.ts）+ 改动 5（src/content/db.ts / src/review/state-machine.ts / src/admin/ingest.ts / src/ops-app.ts / test/integration/helpers.ts）+ 本计划文档；零清单外文件
 4. known holes 入 PR body（spec §10 五条）+ not-architecture-impact 声明（spec §11）
@@ -990,3 +990,8 @@ git commit -m "test(review): 真 pg 并发验收（P1 回归/CAS 竞争零残留
 | 备注 | — | spec §10 | ingest.track_id 无 UNIQUE：跨 ingest 同 track_id 并发 approve 不在同一行锁串行化范围，后提交方撞 PK 全事务回滚 | **fold**：spec §10 新增 known hole 5（既有输入边界，非本专项引入，schema 不变） |
 
 核实备注：P1 经场景推演证实（revoke 见 approved ⇔ approve 已全提交，原交错在真 pg READ COMMITTED 不可能；随机测试判别力不足属实）；两 P2 均属分布式事务真实边界，表述诚实化。codex 结论「同一 ingest 唯一写入方前提下，修正后的 READ COMMITTED 正确性成立」——总体路线未动摇。计数锚更新 269→276→278→283（Layer 1 七用例 + Layer 3 五用例）。
+
+## 锚点口径注记（2026-08-06，SDD 期间补充）
+
+- `/tmp/e2e-seed.json`（docker seed 产物）生命周期影响 `token-verify.e2e.test.ts` 7 用例的过/败归属（该文件属 4 个既有环境依赖失败文件之一）：Task 1 时在场（全量 291），Task 2 时缺席（同 commit 基线 284，全量 286）。
+- **代码增量判据=同 commit 基线对比**（stash 或 BASE 对比），绝对数以实测环境口径为准：seed 缺席口径 277（pre-T1）→284（T1 后）→286（T2 后）→291（T3 后期望）；seed 在场口径各 +7。
