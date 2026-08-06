@@ -10,7 +10,7 @@
     "backend_type": {"type": "string", "enum": ["platform_backend", "third_party_api", "self_hosted"]},
     "capability_mode": {"type": "string", "enum": ["real", "mock", "unavailable", "degraded"]},
     "completion_state": {"type": "string", "enum": ["DONE", "DONE_WITH_CONCERNS", "BLOCKED", "NEEDS_CONTEXT"]},
-    "error_code": {"type": "string", "enum": ["NO_RESULT", "AUTH_FAILED", "REGION_RESTRICTED", "COPYRIGHT_RESTRICTED", "BACKEND_UNAVAILABLE", "CAPABILITY_UNSUPPORTED"]},
+    "error_code": {"type": "string", "enum": ["NO_RESULT", "AUTH_FAILED", "REGION_RESTRICTED", "COPYRIGHT_RESTRICTED", "BACKEND_UNAVAILABLE", "CAPABILITY_UNSUPPORTED", "INVALID_TOKEN", "DEVICE_NOT_BOUND", "JWKS_UNAVAILABLE", "LOOKUP_UNAVAILABLE", "INVALID_ENVELOPE"]},
     "query": {"$ref": "#/$defs/query"},
     "candidates": {"type": "array", "items": {"$ref": "#/$defs/candidate"}},
     "match": {"$ref": "#/$defs/match"},

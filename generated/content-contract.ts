@@ -13,7 +13,12 @@ export type AgentOSContentContract = {
     | "REGION_RESTRICTED"
     | "COPYRIGHT_RESTRICTED"
     | "BACKEND_UNAVAILABLE"
-    | "CAPABILITY_UNSUPPORTED";
+    | "CAPABILITY_UNSUPPORTED"
+    | "INVALID_TOKEN"
+    | "DEVICE_NOT_BOUND"
+    | "JWKS_UNAVAILABLE"
+    | "LOOKUP_UNAVAILABLE"
+    | "INVALID_ENVELOPE";
   query?: Query;
   candidates?: Candidate[];
   match?: Match;
