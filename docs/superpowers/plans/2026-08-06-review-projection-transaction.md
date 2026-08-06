@@ -27,7 +27,7 @@
 **Files:**
 - Modify: `src/content/db.ts`（加 Queryable / TransactionalContentDb，ContentDb 结构不变）
 - Create: `src/db/transaction.ts`（wrapPgPool + PgPoolLike/PgClientLike）
-- Create: `test/unit/db-transaction.test.ts`（Layer 1 fake pool 契约测试 5 用例）
+- Create: `test/unit/db-transaction.test.ts`（Layer 1 fake pool 契约测试 7 用例）
 
 **Interfaces:**
 - Consumes: 无（本 task 不依赖其他 task）
@@ -64,7 +64,7 @@ interface FakeClient {
   release(): void;
 }
 
-function fakePool(opts: { failClientQuery?: string } = {}) {
+function fakePool(opts: { failClientQuery?: string[] } = {}) {
   const clients: FakeClient[] = [];
   const released: FakeClient[] = [];
   const poolQueries: string[] = [];
@@ -77,7 +77,7 @@ function fakePool(opts: { failClientQuery?: string } = {}) {
       const client: FakeClient = {
         queries: [],
         async query(text, params) {
-          if (opts.failClientQuery && text === opts.failClientQuery) {
+          if (opts.failClientQuery?.includes(text)) {
             throw new Error("boom:" + text);
           }
           client.queries.push({ text, params });
@@ -131,7 +131,7 @@ describe("wrapPgPool 契约（Layer 1）", () => {
   });
 
   it("ROLLBACK 自身失败：不遮盖原错误，release 仍被调", async () => {
-    const { pool, released } = fakePool({ failClientQuery: "ROLLBACK" });
+    const { pool, released } = fakePool({ failClientQuery: ["ROLLBACK"] });
     const db = wrapPgPool(pool);
     await expect(
       db.withTransaction(async () => {
@@ -142,7 +142,7 @@ describe("wrapPgPool 契约（Layer 1）", () => {
   });
 
   it("COMMIT 失败：尝试 ROLLBACK + 抛原错误 + release", async () => {
-    const { pool, clients, released } = fakePool({ failClientQuery: "COMMIT" });
+    const { pool, clients, released } = fakePool({ failClientQuery: ["COMMIT"] });
     const db = wrapPgPool(pool);
     await expect(
       db.withTransaction(async (tx) => {
@@ -161,13 +161,37 @@ describe("wrapPgPool 契约（Layer 1）", () => {
     expect(poolQueries).toEqual(["SELECT 2"]);
     expect(clients.length).toBe(0); // 未动用 connect
   });
+
+  it("BEGIN 失败：回调未执行，release 仍被调，原错误透传（fold codex P2）", async () => {
+    const { pool, released } = fakePool({ failClientQuery: ["BEGIN"] });
+    const db = wrapPgPool(pool);
+    let fnRan = false;
+    await expect(
+      db.withTransaction(async () => {
+        fnRan = true;
+      }),
+    ).rejects.toThrow("boom:BEGIN");
+    expect(fnRan).toBe(false); // BEGIN 失败时回调不得执行
+    expect(released.length).toBe(1);
+  });
+
+  it("COMMIT+ROLLBACK 双失败：原错误不丢，release 仍被调（fold codex P2）", async () => {
+    const { pool, released } = fakePool({ failClientQuery: ["COMMIT", "ROLLBACK"] });
+    const db = wrapPgPool(pool);
+    await expect(
+      db.withTransaction(async (tx) => {
+        await tx.query("SELECT 1");
+      }),
+    ).rejects.toThrow("boom:COMMIT"); // 原错误透传，ROLLBACK 失败不遮盖
+    expect(released.length).toBe(1);
+  });
 });
 ```
 
 - [ ] **Step 4: 跑测试确认 RED**
 
 Run: `pnpm vitest run test/unit/db-transaction.test.ts`
-Expected: FAIL——`src/db/transaction.ts` 不存在，import 解析失败（5 用例全红）
+Expected: FAIL——`src/db/transaction.ts` 不存在，import 解析失败（7 用例全红）
 
 - [ ] **Step 5: port 类型扩展**
 
@@ -228,11 +252,13 @@ export function wrapPgPool(pool: PgPoolLike): TransactionalContentDb {
         await client.query("COMMIT");
         return result;
       } catch (err) {
-        // COMMIT 失败同样走此路径（COMMIT 失败后 ROLLBACK 安全）
+        // 注：COMMIT 通信失败 = 事务结果未知（spec §10 known hole 4）——
+        // 服务端可能已提交而响应丢失；此处不做「必然回滚」绝对断言，报错路径不 emit audit
         try {
           await client.query("ROLLBACK");
-        } catch {
-          // ROLLBACK 失败（连接断等）：不遮盖原错误，连接回收靠 finally release
+        } catch (rollbackErr) {
+          // ROLLBACK 失败：不遮盖原错误，记录后靠 finally release 回收连接
+          console.error("[tx] ROLLBACK failed:", rollbackErr);
         }
         throw err;
       } finally {
@@ -245,8 +271,8 @@ export function wrapPgPool(pool: PgPoolLike): TransactionalContentDb {
 
 - [ ] **Step 7: 跑测试确认 GREEN + 全量回归 + tsc**
 
-Run: `pnpm vitest run test/unit/db-transaction.test.ts` → Expected: 5 passed
-Run: `pnpm test` → Expected: 274 passed（基线 269 + 本 task 5）/ 29 skipped / 4 既有环境失败文件不变
+Run: `pnpm vitest run test/unit/db-transaction.test.ts` → Expected: 7 passed
+Run: `pnpm test` → Expected: 276 passed（基线 269 + 本 task 7）/ 29 skipped / 4 既有环境失败文件不变
 Run: `pnpm build` → Expected: exit 0
 
 - [ ] **Step 8: Commit**
@@ -563,7 +589,7 @@ export function createTestDb(opts: { withLyrics?: boolean; withIngest?: boolean 
 Run: `pnpm vitest run test/unit/review-tx-affinity.test.ts` → Expected: 2 passed
 Run: `pnpm vitest run test/unit/review-state.test.ts` → Expected: 10 passed（既有用例不改动通过，类型兼容验证）
 Run: `pnpm vitest run test/integration/review-ui-acceptance.e2e.test.ts` → Expected: 3 passed（切换后行为不变验证）
-Run: `pnpm test` → Expected: 276 passed（274 + 本 task 2）/ 29 skipped / 4 既有环境失败文件不变
+Run: `pnpm test` → Expected: 278 passed（276 + 本 task 2）/ 29 skipped / 4 既有环境失败文件不变
 Run: `pnpm build` → Expected: exit 0
 
 - [ ] **Step 8: Commit**
@@ -603,7 +629,7 @@ import {
 } from "@testcontainers/postgresql";
 import { Pool } from "pg";
 import { buildOpsApp } from "../../src/ops-app.js";
-import { wrapPgPool } from "../../src/db/transaction.js";
+import { wrapPgPool, type PgPoolLike } from "../../src/db/transaction.js";
 
 // DDL 与 test/integration/helpers.ts INGEST_DDL/REVIEW_DDL/TRACKS_DDL 同源
 const INGEST_DDL = `CREATE TABLE IF NOT EXISTS ingest (
@@ -722,7 +748,77 @@ runSuite("审核投影事务化：真 pg 并发验收（Layer 3）", () => {
     };
   }
 
-  it("Case A：approve/revoke 并发——P1 第三态绝不出现（20 轮）", async () => {
+  it("Case A：确定性 barrier 交错——A 过 CAS 后暂停，B revoke 完整执行，A 恢复（P1 回归判别器）", async () => {
+    // fold codex 跨厂商 P1：随机并发绝大多数落入「revoke 409」分支，无判别力；
+    // 记录型 PgPoolLike 钩住 approve 的 CAS UPDATE：A 过 CAS（未提交）后暂停，
+    // 此刻放 B revoke 完整执行，再恢复 A。
+    // 事务实现：B 读 pending（A 未提交不可见）→ 409，终态 approved + 投影在；
+    // 若退回非事务三语句：A 的 CAS 自动提交，B 读到 approved 完成 revoke → P1 第三态，断言失败。
+    const id = "ingbar";
+    const trackId = "self:bar";
+    await seedIngest(id, trackId, "pending");
+    let notifyAAtCas: () => void = () => {};
+    const aAtCas = new Promise<void>((r) => {
+      notifyAAtCas = r;
+    });
+    let notifyBDone: () => void = () => {};
+    const bDone = new Promise<void>((r) => {
+      notifyBDone = r;
+    });
+    let casHookArmed = true;
+    const instrumented: PgPoolLike = {
+      query: (text, params) => pool.query(text, params as any[]),
+      connect: async () => {
+        const c = await pool.connect();
+        return {
+          query: async (text: string, params?: unknown[]) => {
+            const r = await c.query(text, params as any[]);
+            if (casHookArmed && text.startsWith("UPDATE ingest SET state")) {
+              casHookArmed = false;
+              notifyAAtCas(); // 通知 B 出发
+              await bDone; // A 暂停：等 B 完整执行完（模拟 await 让出点交错）
+            }
+            return r;
+          },
+          release: () => c.release(),
+        };
+      },
+    };
+    const barApp = await buildOpsApp({
+      db: wrapPgPool(instrumented),
+      adminToken: "bar-a",
+      operatorToken: "bar-o",
+    });
+    const lr = await barApp.inject({
+      method: "POST",
+      url: "/admin/login",
+      payload: { token: "bar-o" },
+    });
+    const sc = lr.headers["set-cookie"];
+    const barCookie = Array.isArray(sc) ? sc[0] : sc;
+    const apPromise = barApp.inject({
+      method: "POST",
+      url: `/admin/ingest/${id}/approve`,
+      headers: { cookie: barCookie },
+    });
+    await aAtCas; // A 已执行 CAS（未提交）并暂停
+    const rv = await barApp.inject({
+      method: "POST",
+      url: `/admin/ingest/${id}/revoke`,
+      headers: { cookie: barCookie },
+    });
+    notifyBDone(); // 放行 A 继续
+    const ap = await apPromise;
+    expect(rv.statusCode).toBe(409); // B 读 pending（A 未提交）→ 矩阵拒绝
+    expect(ap.statusCode).toBe(200);
+    const t = await terminal(id, trackId);
+    expect(t.state).toBe("approved");
+    expect(t.trackCount).toBe(1);
+    expect(t.reviewCount).toBe(1);
+    await barApp.close();
+  });
+
+  it("Case A2：approve/revoke 随机并发巡逻——P1 第三态绝不出现（20 轮，统计巡逻层）", async () => {
     for (let round = 0; round < 20; round++) {
       const id = `inga${round}`;
       const trackId = `self:a${round}`;
@@ -819,17 +915,39 @@ runSuite("审核投影事务化：真 pg 并发验收（Layer 3）", () => {
     expect(upd.rowCount).toBe(1);
     await pool.query("UPDATE ingest SET state='pending' WHERE id='ingc'");
   });
+
+  it("Case D：真实三步路径中途失败全回滚（tracks PK 冲突）", async () => {
+    // fold codex 跨厂商 P2：真 pg 层验本专项声称闭合的真实路径，非手写 UPDATE 通用回滚。
+    // tracks.track_id 已存在 → approve 的投影 INSERT 撞 PK 冲突 → 整个事务回滚：
+    // ingest 仍 pending、review 0 行、tracks 不变（spec §1.2 附带收益变实测保证）。
+    await seedIngest("ingd", "self:dup", "pending");
+    await pool.query(
+      "INSERT INTO tracks (track_id, title, artist, duration_ms, audio_object_key, format, bitrate, license) VALUES ('self:dup','X','Y',1,'k','mp3',128,'CC')",
+    );
+    const ap = await app.inject({
+      method: "POST",
+      url: "/admin/ingest/ingd/approve",
+      headers: { cookie: opCookie },
+    });
+    expect(ap.statusCode).toBe(500); // PK 冲突非 NOT_FOUND/INVALID_TRANSITION，透传 500
+    const st = await pool.query("SELECT state FROM ingest WHERE id='ingd'");
+    expect(String(st.rows[0].state)).toBe("pending"); // CAS 已回滚
+    const rv = await pool.query("SELECT count(*)::int AS c FROM review WHERE ingest_id='ingd'");
+    expect(Number(rv.rows[0].c)).toBe(0); // review 已回滚
+    const tr = await pool.query("SELECT count(*)::int AS c FROM tracks WHERE track_id='self:dup'");
+    expect(Number(tr.rows[0].c)).toBe(1); // 原发布记录不受影响
+  });
 });
 ```
 
 - [ ] **Step 2: 跑验收测试（预期直接 GREEN）**
 
 Run: `pnpm vitest run test/integration/review-projection-tx.e2e.test.ts`
-Expected: 3 passed（Docker 可用时；首次跑含容器启动，记录实际耗时入 report）。若 Docker 不可用 → 3 skipped（describe.skip 生效，如实记录）。若 Case A/B 出现第三态/双赢家 → **P1 未修复信号，立即停，报老林**（不自决重试超 2 次）
+Expected: 5 passed（Docker 可用时；首次跑含容器启动，记录实际耗时入 report）。若 Docker 不可用 → 5 skipped（describe.skip 生效，如实记录）。若 Case A barrier 断言失败（rv 非 409 / 终态非 approved）→ **P1 未修复信号，立即停，报老林**（不自决重试超 2 次）
 
 - [ ] **Step 3: 全量回归 + tsc**
 
-Run: `pnpm test` → Expected: 279 passed（276 + 本 task 3，Docker 可用时）/ 29 skipped / 4 既有环境失败文件不变（本文件 Docker 不可用时 skip 不入失败集）
+Run: `pnpm test` → Expected: 283 passed（278 + 本 task 5，Docker 可用时）/ 29 skipped / 4 既有环境失败文件不变（本文件 Docker 不可用时 skip 不入失败集）
 Run: `pnpm build` → Expected: exit 0
 
 - [ ] **Step 4: Commit**
@@ -843,10 +961,10 @@ git commit -m "test(review): 真 pg 并发验收（P1 回归/CAS 竞争零残留
 
 ## 收尾验证（全 task 完成后，归链上 verification-before-completion，非 task）
 
-1. `pnpm test` 全量复跑：279 passed / 29 skipped / 4 既有环境失败集合不变（Docker 可用口径；不可用则 276+3skip 并注明）
+1. `pnpm test` 全量复跑：283 passed / 29 skipped / 4 既有环境失败集合不变（Docker 可用口径；不可用则 278+5skip 并注明）
 2. `pnpm build` exit 0
 3. Surgical scope 核对：`git diff main --stat` 对 File Structure——新增 4（src/db/transaction.ts / test/unit/db-transaction.test.ts / test/unit/review-tx-affinity.test.ts / test/integration/review-projection-tx.e2e.test.ts）+ 改动 5（src/content/db.ts / src/review/state-machine.ts / src/admin/ingest.ts / src/ops-app.ts / test/integration/helpers.ts）+ 本计划文档；零清单外文件
-4. known holes 入 PR body（spec §10 三条）+ not-architecture-impact 声明（spec §11）
+4. known holes 入 PR body（spec §10 五条）+ not-architecture-impact 声明（spec §11）
 
 ---
 
@@ -861,3 +979,14 @@ git commit -m "test(review): 真 pg 并发验收（P1 回归/CAS 竞争零残留
 | 5 | M | Task 3 Case C2 | 零残留断言由 MVCC 保证，无法区分「已回滚」与「回滚未完成」，未验锁释放 | **fold**：追加经 pool 的 UPDATE rowCount=1 断言（孤儿事务持锁则阻塞超时）+ 恢复 pending |
 
 核实备注：finding 1 对照 state-machine.ts:71（transition 内 fetchIngest）属实；finding 3 对照 seed.test.ts:29/44（钉镜像+240s）属实；其余两项为有效强化。Eng 清单外取证均已说明理由（session.ts cookie 链/policy-store 构造期零查询/vitest.config include/调用点 `db: any` 兼容）。
+
+## Fold 记录 — codex 跨厂商 plan review（2026-08-06，gpt-5.6-sol/openai 代理，VERDICT=FAIL 1P1/2P2 全 fold）
+
+| # | 严重度 | 位置 | 问题 | 处置 |
+|---|---|---|---|---|
+| 1 | P1 | spec §5 / Task 3 Case A | 并发论证机制归属错（approve/revoke 对实为已提交可见性串行化，非行锁阻塞）；Case A 随机并发绝大多数落「revoke 409」分支，实现退回非事务也可能 GREEN，无回归判别力 | **fold**：spec §5 重写（场景 1=已提交可见性，场景 2=行锁+EPQ，两机制分归）；Case A 升级为确定性 barrier 判别器（记录型 PgPoolLike 钩住 approve CAS：A 未提交暂停→B 完整执行→A 恢复；事务实现断言 B 409+approved+投影在，非事务回归落第三态必 FAIL）；原随机 20 轮降为 Case A2 统计巡逻层 |
+| 2 | P2 | Task 1 wrapper / spec §6-7 | ROLLBACK 异常静默吞；COMMIT 通信失败（服务端已提交响应丢失）被表述为确定回滚，超 pg 可保证语义 | **fold**：wrapper ROLLBACK catch 记录 rollbackErr（console.error）不遮盖原错误；spec §6 COMMIT 行改「结果未知」表述 + §7 emit 保证限定可观察错误路径 + spec §10 新增 known hole 4；Layer 1 补 BEGIN 失败（回调未执行）+ COMMIT/ROLLBACK 双失败两契约用例（5→7 用例） |
+| 3 | P2 | Task 3 Case C | 只验手写 UPDATE 通用回滚，未验本专项真实三步路径中途失败（tracks INSERT 冲突）的全回滚 | **fold**：新增 Case D——预置 tracks PK 冲突，HTTP approve 触发真实 ingestTransitionAndAudit 路径失败，断言 ingest 仍 pending / review 0 行 / tracks 不变；同步 spec §8 Layer 3 用例表 + §9 判据 4 |
+| 备注 | — | spec §10 | ingest.track_id 无 UNIQUE：跨 ingest 同 track_id 并发 approve 不在同一行锁串行化范围，后提交方撞 PK 全事务回滚 | **fold**：spec §10 新增 known hole 5（既有输入边界，非本专项引入，schema 不变） |
+
+核实备注：P1 经场景推演证实（revoke 见 approved ⇔ approve 已全提交，原交错在真 pg READ COMMITTED 不可能；随机测试判别力不足属实）；两 P2 均属分布式事务真实边界，表述诚实化。codex 结论「同一 ingest 唯一写入方前提下，修正后的 READ COMMITTED 正确性成立」——总体路线未动摇。计数锚更新 269→276→278→283（Layer 1 七用例 + Layer 3 五用例）。
