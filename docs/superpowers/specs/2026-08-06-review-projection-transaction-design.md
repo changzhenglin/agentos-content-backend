@@ -206,7 +206,7 @@ fake PgPoolLike 记录全部调用序列：
 3. Layer 2 既有 13 用例不改通过 + 新增旁路断言 GREEN
 4. Layer 3 本机 Docker 跑：Case A ≥20 轮零第三态 / Case B 恰一成功 / Case C 零残留
 5. `pnpm build`（tsc）exit 0
-6. Surgical scope：diff 限于 §4 File Structure 清单（新增 3：`src/db/transaction.ts` + 测试文件 2；改动 5：`content/db.ts` / `state-machine.ts` / `admin/ingest.ts` / `ops-app.ts` / `test/integration/helpers.ts`）
+6. Surgical scope：diff 限于 §4 File Structure 清单（新增 4：`src/db/transaction.ts` + 测试文件 3；改动 5：`content/db.ts` / `state-machine.ts` / `admin/ingest.ts` / `ops-app.ts` / `test/integration/helpers.ts`）
 
 ## §10 known holes（预期，PR 如实标注）
 
