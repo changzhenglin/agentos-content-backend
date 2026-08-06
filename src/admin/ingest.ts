@@ -4,7 +4,7 @@
 // （meta.durationMs/coverUrl/isrc/regionPolicy/album），fold codex P1#7/eng I2。
 // audit target 非空：ingestTransitionAndAudit 先 fetchIngest 取 trackId 再 emit
 // （fold eng I1/ceo I2，避免 transition 内部不可见导致 target 空）。
-import type { ContentDb } from "../content/db.js";
+import type { ContentDb, Queryable, TransactionalContentDb } from "../content/db.js";
 import { transition } from "../review/state-machine.js";
 import type { AuditSink } from "../audit/audit-sink.js";
 import { emitProvision, emitRevoke } from "../audit/audit-events.js";
@@ -40,7 +40,7 @@ export async function ingestCreate(
 
 // fetchIngest 取 trackId（fold eng I1：audit target 非空，避免 transition 内部不可见）
 async function fetchIngestTrackId(
-  db: ContentDb,
+  db: Queryable,
   ingestId: string,
 ): Promise<string | null> {
   const { rows } = await db.query(
@@ -51,16 +51,21 @@ async function fetchIngestTrackId(
 }
 
 export async function ingestTransitionAndAudit(
-  db: ContentDb,
+  db: TransactionalContentDb,
   auditSink: AuditSink | undefined, // I2 fix: pass-through undefined（emit 函数已 guard）
   ingestId: string,
   action: "approve" | "reject" | "revoke",
   actor: string,
   reason?: string,
 ): Promise<{ trackId: string | null }> {
-  // 先取 trackId 再 transition（target 非空，fold eng I1）
-  const trackId = await fetchIngestTrackId(db, ingestId);
-  await transition(db, ingestId, action, actor, reason);
+  // CAS + review + tracks 投影同一连接/事务（spec §4.4）：
+  // 并发转换由 pg 行锁串行化，回滚保证无局部残留（P1 根治）。
+  const { trackId } = await db.withTransaction(async (tx) => {
+    const tid = await fetchIngestTrackId(tx, ingestId); // trackId 读取进事务（一致性读）
+    await transition(tx, ingestId, action, actor, reason);
+    return { trackId: tid };
+  });
+  // audit 仅 COMMIT 后 emit（spec §7/D4）：失败/回滚的审核动作不进 audit
   if (action === "approve" && trackId) {
     await emitProvision(auditSink, { ingestId, trackId, actor });
   }
