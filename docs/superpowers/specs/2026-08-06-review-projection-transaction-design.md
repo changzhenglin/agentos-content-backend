@@ -138,25 +138,29 @@ schema.ts / migrations / ingestCreate / policy-store / 队列页/详情页/track
 
 ## §5 并发正确性论证（READ COMMITTED 充分性）
 
-**场景 1：A approve 与 B revoke 并发（P1 原交错）**
+> 机制归属修正（fold codex 跨厂商 plan review P1）：approve/revoke 对靠**已提交可见性**串行化；approve/reject 对靠**行锁 + CAS 条件重检（EPQ）**串行化。两机制不同，不可混用。
 
-1. A tx：BEGIN → CAS `UPDATE ingest SET state='approved' WHERE id AND state='pending' RETURNING id` → 命中，**该行加行锁（未提交）** → await 让出
-2. B tx：BEGIN → CAS `UPDATE ... WHERE state='approved'` → 撞 A 的行锁，**阻塞等待**
-3. A 恢复：INSERT review → INSERT tracks → COMMIT（释放锁）
-4. B 解除阻塞：READ COMMITTED 下 UPDATE 被阻塞后**按最新已提交版本重检 WHERE 条件**（EPQ）→ 见 state='approved' → CAS 命中 → DELETE tracks（删掉 A 已提交的投影）→ COMMIT
-5. 终态：`revoked + tracks 空`——P1 第三态（revoked+曲目在）不存在
+**场景 1：A approve 与 B revoke 并发（P1 原交错）——机制=已提交可见性**
 
-**场景 2：B 先赢锁**
+1. READ COMMITTED 下每条语句读**已提交**版本。A 的 tx 执行 CAS 后未提交，B revoke 的前置读（fetchIngest）只能看到 pending（A 的 CAS 不可见）
+2. B 见 pending → 矩阵拒绝 revoke（`ALLOWED.pending=[approve,reject]`）→ INVALID_TRANSITION（409），B 根本不触及行锁
+3. 若 B 的前置读发生在 A COMMIT 之后 → 见 approved（此时 A 的投影 INSERT 已随事务提交）→ B 正常走 revoke：CAS approved→revoked（行锁此刻无人争）+ DELETE tracks（删掉 A 已提交的投影）→ COMMIT
+4. 两个分支穷尽：终态要么 `approved + tracks 在 + review 1 行`，要么 `revoked + tracks 空 + review 2 行`——**P1 第三态（revoked+曲目在）不存在**。关键：B 永远不可能「在 A 的 CAS 与投影之间插进去完成整个 revoke」，因为看见 approved ⇔ A 已全量提交
 
-B 的 revoke 需要 state='approved'，而初始是 pending → B 的 CAS 本就 INVALID_TRANSITION（矩阵层拒绝，approve→revoke 之外的并发同理）。真正竞争对（approve vs reject 抢 pending）：输家 CAS 重检见 state 已非 pending → 0 行 → INVALID_TRANSITION → **ROLLBACK，review 行与投影零残留**。
+**场景 2：A approve 与 B reject 并发（同态竞争）——机制=行锁 + EPQ 重检**
+
+1. 两者前置读都见 pending（均合法：`ALLOWED.pending=[approve,reject]`），都到达 CAS UPDATE
+2. 并发 UPDATE 同一行 → **pg 行锁串行化**：一方先执行并持锁（未提交），另一方阻塞
+3. 赢家 COMMIT 释放锁；输家的 UPDATE 解除阻塞后，READ COMMITTED 下**按最新已提交版本重检 WHERE 条件**（EPQ）→ 旧状态条件不再满足 → 0 行 → INVALID_TRANSITION → ROLLBACK，**review 行与投影零残留**
+4. 输家若重检时条件仍满足（不存在此情形——赢家必已改 state）则两者都过，但 CAS 的旧状态条件语义使其不可能同时命中
 
 **场景 3：崩溃窗口**
 
 任何一步崩溃 → 未 COMMIT 的事务整体丢失（pg 恢复时回滚）→ 不再存在「状态改了、投影没写」的半提交态。
 
-**为何不升隔离级别**：串行化由行锁天然提供（同 ingest 行的并发 UPDATE 排队），CAS 条件重检保证输家无副作用；SERIALIZABLE 会带来序列化失败重试复杂度，无额外收益。
+**为何不升隔离级别**：场景 1 由已提交可见性闭合，场景 2 由行锁+EPQ 闭合，均只需 READ COMMITTED；SERIALIZABLE 带来序列化失败重试复杂度，无额外收益。
 
-**论证边界**：本论证依赖真 pg 的行锁与 EPQ 语义，pg-mem 无法模拟——故 §8 Layer 3 用真 pg 实测兜底。
+**论证边界**：本论证依赖真 pg 的 MVCC/行锁语义，pg-mem 无法模拟——故 §8 Layer 3 用真 pg 实测兜底（含确定性 barrier 交错用例，见 §8）。
 
 ## §6 错误处理
 
@@ -164,13 +168,15 @@ B 的 revoke 需要 state='approved'，而初始是 pending → B 的 CAS 本就
 |---|---|
 | 回调抛 NOT_FOUND / INVALID_TRANSITION | ROLLBACK + release + 原样抛出；路由层 404/409 语义不变 |
 | 回调抛其他错（如 tracks INSERT 冲突） | ROLLBACK + release + 抛出（路由层 500，**无孤儿记录**——本专项附带收益） |
-| ROLLBACK 自身失败（连接断） | 记录日志 + release + 抛**原错误**（不让回滚错误遮盖业务错误） |
-| COMMIT 失败 | 进 catch → 尝试 ROLLBACK（COMMIT 失败后 ROLLBACK 安全）→ 抛原错误 |
+| ROLLBACK 自身失败（连接断） | **记录 rollbackErr（console.error，不静默）** + release + 抛**原错误**（不让回滚错误遮盖业务错误） |
+| COMMIT 失败/通信丢失 | 进 catch → 尝试 ROLLBACK → 抛原错误。⚠️ **服务端可能已提交而响应丢失，事务结果未知**（见 §10 known hole 4），不做「必然回滚」的绝对断言 |
+| BEGIN 失败 | 进 catch（回调未执行）→ ROLLBACK 尝试安全忽略失败 → release + 抛原错误 |
 | release | finally 保证，连接泄漏不可能（Layer 1 契约测试守护） |
 
 ## §7 audit 链时序
 
 - emit 保持 COMMIT 后（§4.4）：失败/回滚的审核动作不进 audit——与现状行为一致（现状 throw 也不 emit），事务化后这是**保证**而非巧合
+- 边界注记（fold codex P2）：COMMIT 通信失败（服务端已提交、响应丢失）时路由报错且不 emit，但 DB 可能已提交——「emit 仅在提交后」的保证限于**客户端可观察的错误路径**，结果未知窗口见 §10 known hole 4
 - audit target（trackId）在事务内读取（track_id 自 ingestCreate 后不可变，事务内读只是口径一致）
 - AUDIT_SINK_PATH 默认空 → emit 静默 no-op（known hole 1 维持，不在本专项改）
 
@@ -194,9 +200,11 @@ fake PgPoolLike 记录全部调用序列：
 ### Layer 3 · 真 pg 并发验收（testcontainers；Docker 缺失诚实 skip）——新文件 `test/integration/review-projection-tx.e2e.test.ts`
 
 - 模式照 `test/db/seed.test.ts` 先例：`@testcontainers/postgresql ^12.0.4`（已在 devDependencies）+ `dockerAvailable()` skip 门
-- **Case A（P1 回归）**：同一 ingest 并发 approve+revoke，随机延迟跑 ≥20 轮；断言终态 ∈ {approved+tracks 有一行, revoked+tracks 无行}，**绝不出现第三态（revoked+tracks 有行=P1）**；review 表行数=成功转换数
-- **Case B（CAS 竞争零残留）**：同一 pending ingest 并发 approve+reject → 恰好一个 200 一个 409；review 表恰一行；tracks 与终态一致
-- **Case C（断连零残留）**：事务中途强断 client（模拟崩溃）→ 重查 DB 状态无变化（pg 自动回滚未提交事务）
+- **Case A（确定性 barrier 交错，P1 回归判别器）**：记录型 PgPoolLike 钩住 approve 的 CAS UPDATE——A 过 CAS（未提交）后暂停；此时放 B revoke 完整执行；再恢复 A。事务实现断言：B 读 pending（A 未提交不可见）→ 409，终态 `approved + tracks 一行 + review 一行`。**回归判别力**：若实现退回非事务三语句，A 的 CAS 自动提交，B 将读到 approved 并完成 revoke，终态落入 P1 第三态 → 断言失败（fold codex 跨厂商 P1：随机并发无法确定性命中交错，必须 barrier）
+- **Case A2（随机巡逻 20 轮）**：approve+revoke 并发 + 0–5ms stagger，断言终态两分支不变量（统计巡逻层，非判别器）
+- **Case B（CAS 竞争零残留）**：同一 pending ingest 并发 approve+reject → 恰好一个 200 一个 409；review 表恰一行；tracks 与终态一致（行锁+EPQ 机制实证，§5 场景 2）
+- **Case C（回滚/断连零残留）**：wrapper 回调中途抛错 → 状态不变；连接事务中途强断（release(true)）→ 状态不变 + 行锁释放实证（经 pool UPDATE rowCount=1）
+- **Case D（真实三步路径中途失败全回滚）**：预置 tracks PK 冲突（同 track_id 已发布），HTTP approve 触发 tracks INSERT 失败 → 断言 ingest 仍 pending、review 0 行、tracks 不变（fold codex P2：真 pg 层必须验本专项声称闭合的真实路径，非手写 UPDATE 通用回滚）
 - 定位：本层=验收所需「真并发证据」；SDD verification 阶段本机跑（Docker 29.6.1 可用已探测），无 Docker 环境诚实 skip（known hole 同源先例）
 
 ## §9 验收标准（可度量）
@@ -204,7 +212,7 @@ fake PgPoolLike 记录全部调用序列：
 1. `pnpm test` 零回归：基线 269 passed / 29 skipped 只增不减；4 个既有环境依赖失败文件集合不变（Docker/testcontainers、真 IAM seed、device-hub 直连）
 2. Layer 1 全 GREEN（5 类契约用例）
 3. Layer 2 既有 13 用例不改通过 + 新增旁路断言 GREEN
-4. Layer 3 本机 Docker 跑：Case A ≥20 轮零第三态 / Case B 恰一成功 / Case C 零残留
+4. Layer 3 本机 Docker 跑：Case A barrier 确定性判别 GREEN / Case A2 20 轮零第三态 / Case B 恰一成功 / Case C 零残留+锁释放 / Case D 真实路径全回滚
 5. `pnpm build`（tsc）exit 0
 6. Surgical scope：diff 限于 §4 File Structure 清单（新增 4：`src/db/transaction.ts` + 测试文件 3；改动 5：`content/db.ts` / `state-machine.ts` / `admin/ingest.ts` / `ops-app.ts` / `test/integration/helpers.ts`）
 
@@ -213,6 +221,8 @@ fake PgPoolLike 记录全部调用序列：
 1. 真 pg 层证据依赖 Docker——CI 无 Docker 环境诚实 skip（known hole 8 同源先例）
 2. pg-mem 3.0.14 无事务语义（spike 实证）——Layer 2 不验回滚，靠 Layer 1+3 担当；若未来 pg-mem 升级支持事务可回收此 hole
 3. 多进程部署场景**设计上覆盖**（DB 行锁）但本专项不实测（sim 单进程；未来多进程部署时另立集成测试）
+4. **COMMIT 通信失败=事务结果未知**（fold codex 跨厂商 P2）：服务端已提交而 COMMIT 响应丢失（断连等）时，客户端进 catch 报错且不 emit audit，但 DB 可能已提交。分布式事务通用边界，非本专项引入；已提交动作缺 audit 行的风险限于此窗口
+5. **ingest.track_id 无 UNIQUE 约束**（fold codex 跨厂商备注）：跨 ingest 共享 track_id 不在同一行锁串行化范围；两个 ingest 同 track_id 并发 approve 时，后提交方 tracks INSERT 撞 PK 冲突 → 其事务整体回滚（state 回到转换前）。既有输入边界（schema 不变，spec §2 非目标），非本专项引入
 
 ## §11 not-architecture-impact 声明（预判，PR 时终判）
 
