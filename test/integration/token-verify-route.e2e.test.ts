@@ -195,3 +195,47 @@ describe("token-verify 路由集成（buildServer wire）", () => {
     expect(r.json().error_code).toBe("DEVICE_NOT_BOUND");
   });
 });
+
+describe("I2 unskip 回归守护：5 码响应过全量契约校验（状态码不被 AJV 转 500）", () => {
+  it("无效签名 token → 401 INVALID_TOKEN（非 500）", async () => {
+    const db = createTestDb();
+    await seedTrack(db, baseTrack);
+    const app = await buildServer({
+      env: envOverrides(), db,
+      policyStore: createPolicyStore(db),
+      auditSink: createAuditSink(auditPath),
+      actor: "anonymous-service",
+    });
+    const token = await signToken();
+    const tampered = token.slice(0, -8) + "deadbeef"; // 破坏签名
+    const r = await app.inject({
+      method: "POST", url: "/content_query",
+      headers: { "x-caller-identity": "device-hub", "x-trace-id": "t-i2-401" },
+      payload: {
+        version: 2, kind: "content_query", query: { keywords: ["Sunrise"] },
+        user_token: tampered, device_id: "d-1",
+      },
+    });
+    expect(r.statusCode).toBe(401);
+    expect(r.json().error_code).toBe("INVALID_TOKEN");
+    expect(r.json().completion_state).toBe("BLOCKED");
+  });
+
+  it("非法 version envelope → 400 INVALID_ENVELOPE（非 500；fold Eng C1：{garbage:true} 触发 v1 匿名短路不可用，version:3 才是 parse 失败形状）", async () => {
+    const db = createTestDb();
+    await seedTrack(db, baseTrack);
+    const app = await buildServer({
+      env: envOverrides(), db,
+      policyStore: createPolicyStore(db),
+      auditSink: createAuditSink(auditPath),
+      actor: "anonymous-service",
+    });
+    const r = await app.inject({
+      method: "POST", url: "/content_query",
+      headers: { "x-caller-identity": "device-hub", "x-trace-id": "t-i2-400" },
+      payload: { version: 3, kind: "content_query", query: { keywords: ["Sunrise"] } },
+    });
+    expect(r.statusCode).toBe(400);
+    expect(r.json().error_code).toBe("INVALID_ENVELOPE");
+  });
+});
