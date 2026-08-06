@@ -13,6 +13,15 @@ export interface QueryResultRow {
   [column: string]: unknown;
 }
 
-export interface ContentDb {
+// Queryable：最小查询接口——池与事务句柄同形（spec §4.1）
+export interface Queryable {
   query(text: string, params?: unknown[]): Promise<{ rows: QueryResultRow[] }>;
+}
+
+// ContentDb：结构不变（仍 {query}）；extends Queryable 使既有实现可直接传给 transition(Queryable)
+export interface ContentDb extends Queryable {}
+
+// TransactionalContentDb：带事务能力的 ContentDb（spec §4.1）
+export interface TransactionalContentDb extends ContentDb {
+  withTransaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T>;
 }
