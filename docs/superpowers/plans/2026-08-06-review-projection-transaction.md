@@ -14,7 +14,7 @@
 
 - **零 DDL**：不改 schema.ts / src/db/migrations/；不改任何 frozen 契约（shared-protocols / *-envelope.schema.json / device-hub contract.h 零触碰）
 - **禁触清单**：README.md 与 app layout templates（窗口 C T2 区域）；src/index.ts onSend 区域与 src/auth/token-verify-hook.ts（窗口 C T3 区域）；src/index.ts 其余部分也零改动（不调 buildOpsApp，无需动）
-- **回归基线只增不减**：改动前基线 269 passed / 29 skipped + 4 个既有环境依赖失败文件（test/db/seed.test.ts 需 Docker+ffmpeg / test/integration/token-verify.e2e.test.ts 需真 IAM seed / m3-stage2×2 需 device-hub 直连）；此后每 task 全量跑，新增用例只增不减，4 文件集合不变
+- **回归基线只增不减**：改动前基线 284 passed / 29 skipped（rebase c2ede1d 实测；含窗口 C T2 +8） + 4 个既有环境依赖失败文件（test/db/seed.test.ts 需 Docker+ffmpeg / test/integration/token-verify.e2e.test.ts 需真 IAM seed / m3-stage2×2 需 device-hub 直连）；此后每 task 全量跑，新增用例只增不减，4 文件集合不变
 - **验证命令**：`pnpm test`（vitest run）；`pnpm build`（tsc -p tsconfig.json）必须 exit 0
 - **SDD 写码门禁（Task 1 开工前）**：确认窗口 C T2/T3 已 merge → `git -c https.proxy= fetch` → worktree rebase 到最新 content-backend main（spec §3 D7）；若窗口 C 未 merge，报主窗口裁决，不自决开工
 - **commit 规范**：英文 conventional 前缀 + 冒号后中文描述；代码标识符英文，代码注释中文
@@ -45,7 +45,7 @@ ln -s /Users/lcz/projects/AgentOS /Users/lcz/projects/agentos-content-backend/.c
 - [ ] **Step 2: 记录回归基线**
 
 Run: `pnpm test`
-Expected: 269 passed / 29 skipped；4 个既有环境依赖失败文件集合与 Global Constraints 所列一致。记录实际数字到 report（后续每 task 只增不减的锚点）。`pnpm build` exit 0。
+Expected: 284 passed / 29 skipped；4 个既有环境依赖失败文件集合与 Global Constraints 所列一致。记录实际数字到 report（后续每 task 只增不减的锚点）。`pnpm build` exit 0。
 
 - [ ] **Step 3: 写失败测试（Layer 1 契约，7 用例）**
 
@@ -272,7 +272,7 @@ export function wrapPgPool(pool: PgPoolLike): TransactionalContentDb {
 - [ ] **Step 7: 跑测试确认 GREEN + 全量回归 + tsc**
 
 Run: `pnpm vitest run test/unit/db-transaction.test.ts` → Expected: 7 passed
-Run: `pnpm test` → Expected: 276 passed（基线 269 + 本 task 7）/ 29 skipped / 4 既有环境失败文件不变
+Run: `pnpm test` → Expected: 291 passed（基线 284 + 本 task 7）/ 29 skipped / 4 既有环境失败文件不变
 Run: `pnpm build` → Expected: exit 0
 
 - [ ] **Step 8: Commit**
@@ -589,7 +589,7 @@ export function createTestDb(opts: { withLyrics?: boolean; withIngest?: boolean 
 Run: `pnpm vitest run test/unit/review-tx-affinity.test.ts` → Expected: 2 passed
 Run: `pnpm vitest run test/unit/review-state.test.ts` → Expected: 10 passed（既有用例不改动通过，类型兼容验证）
 Run: `pnpm vitest run test/integration/review-ui-acceptance.e2e.test.ts` → Expected: 3 passed（切换后行为不变验证）
-Run: `pnpm test` → Expected: 278 passed（276 + 本 task 2）/ 29 skipped / 4 既有环境失败文件不变
+Run: `pnpm test` → Expected: 293 passed（291 + 本 task 2）/ 29 skipped / 4 既有环境失败文件不变
 Run: `pnpm build` → Expected: exit 0
 
 - [ ] **Step 8: Commit**
@@ -947,7 +947,7 @@ Expected: 5 passed（Docker 可用时；首次跑含容器启动，记录实际�
 
 - [ ] **Step 3: 全量回归 + tsc**
 
-Run: `pnpm test` → Expected: 283 passed（278 + 本 task 5，Docker 可用时）/ 29 skipped / 4 既有环境失败文件不变（本文件 Docker 不可用时 skip 不入失败集）
+Run: `pnpm test` → Expected: 298 passed（293 + 本 task 5，Docker 可用时）/ 29 skipped / 4 既有环境失败文件不变（本文件 Docker 不可用时 skip 不入失败集）
 Run: `pnpm build` → Expected: exit 0
 
 - [ ] **Step 4: Commit**
@@ -961,7 +961,7 @@ git commit -m "test(review): 真 pg 并发验收（P1 回归/CAS 竞争零残留
 
 ## 收尾验证（全 task 完成后，归链上 verification-before-completion，非 task）
 
-1. `pnpm test` 全量复跑：283 passed / 29 skipped / 4 既有环境失败集合不变（Docker 可用口径；不可用则 278+5skip 并注明）
+1. `pnpm test` 全量复跑：298 passed / 29 skipped / 4 既有环境失败集合不变（Docker 可用口径；不可用则 293+5skip 并注明）
 2. `pnpm build` exit 0
 3. Surgical scope 核对：`git diff main --stat` 对 File Structure——新增 4（src/db/transaction.ts / test/unit/db-transaction.test.ts / test/unit/review-tx-affinity.test.ts / test/integration/review-projection-tx.e2e.test.ts）+ 改动 5（src/content/db.ts / src/review/state-machine.ts / src/admin/ingest.ts / src/ops-app.ts / test/integration/helpers.ts）+ 本计划文档；零清单外文件
 4. known holes 入 PR body（spec §10 五条）+ not-architecture-impact 声明（spec §11）
