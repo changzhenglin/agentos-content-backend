@@ -726,19 +726,9 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
   // ajv onSend validate（解 plan-eng I3，完整实现非注释）：
   // 对每个 string payload（JSON 序列化后）跑 content-contract schema validate，
   // fail 则 throw → fastify 转 500（响应契约违规不应返回给客户端）。
-  // #2 T6 fix-1（Important）：原 `statusCode < 400` 跳过范围过宽——既有错误码
-  // （AUTH_FAILED/COPYRIGHT_RESTRICTED/BACKEND_UNAVAILABLE 等本在 schema enum）的服务端
-  // 契约校验被一并弱化。收窄为：仅 5 新 ErrorCode
-  // （INVALID_TOKEN/DEVICE_NOT_BOUND/JWKS_UNAVAILABLE/LOOKUP_UNAVAILABLE/INVALID_ENVELOPE，
-  // 不在 schema enum，需架构 delta 方可扩，本 task 不触）的 ≥400 响应跳过，
-  // 避失败响应被 AJV 转 500；其余（含既有错误码 + 2xx）仍强校验契约。
-  const NEW_TOKEN_VERIFY_CODES = new Set([
-    "INVALID_TOKEN",
-    "DEVICE_NOT_BOUND",
-    "JWKS_UNAVAILABLE",
-    "LOOKUP_UNAVAILABLE",
-    "INVALID_ENVELOPE",
-  ]);
+  // I2 delta（2026-08-06）：5 个终端用户 token 校验错误码已入 schema error_code enum
+  //（架构 delta 2026-08-06-architecture-content-contract-error-code-delta-design.md），
+  // 原针对这 5 码的定向跳过分支移除，全量契约校验恢复（spec D5）。
   app.addHook("onSend", async (_req, _reply, payload) => {
     const traceId = normalizeInboundTrace(_req.headers["x-trace-id"] as string | undefined);
     if (traceId) {
@@ -750,27 +740,11 @@ export async function buildServer(opts: BuildServerOpts = {}): Promise<ReturnTyp
     if (typeof payload !== "string") {
       return payload;
     }
-    let skip = false;
-    if (_reply.statusCode >= 400) {
-      try {
-        const body = JSON.parse(payload);
-        if (
-          typeof body?.error_code === "string" &&
-          NEW_TOKEN_VERIFY_CODES.has(body.error_code)
-        ) {
-          skip = true; // 5 新码不在 schema enum，跳过避 500
-        }
-      } catch {
-        // 非 JSON payload，不跳过，走正常 validate
-      }
-    }
-    if (!skip) {
-      const body = JSON.parse(payload);
-      if (!validate(body)) {
-        throw new Error(
-          `content-contract validate fail: ${JSON.stringify(validate.errors)}`,
-        );
-      }
+    const body = JSON.parse(payload);
+    if (!validate(body)) {
+      throw new Error(
+        `content-contract validate fail: ${JSON.stringify(validate.errors)}`,
+      );
     }
     return payload;
   });
