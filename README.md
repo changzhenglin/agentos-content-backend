@@ -138,7 +138,7 @@ curl -X POST localhost:3001/content_stream -H 'x-region: us' -d '{"track_id":"se
 ### 验收
 
 ```bash
-pnpm test  # 120/120 PASS（含 sim 闭环 e2e 4 用例：block/allow/region_restrict + audit 链）
+pnpm test  # 269 passed / 29 skipped（含 sim 闭环 e2e 4 用例：block/allow/region_restrict + audit 链）
 ```
 
 sim 闭环 e2e 覆盖全链：producer push → App2 接收（mTLS + audience/expiry/actor 校验）→ App1 kind 受 drm-guard 约束（block→403 / allow→200 / region_restrict+X-Region→403）→ audit hash chain（config_apply + tool_call，verifyChain 完整）。
