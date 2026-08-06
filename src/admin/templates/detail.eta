@@ -1,41 +1,4 @@
-<!doctype html><html><head><meta charset="utf-8"><script src="/public/htmx.min.js"></script><script>htmx.config.responseHandling = [{ code: ".*", swap: true }];</script></head><body>
-<nav><a href="/admin/ingests">待审核</a> | <a href="/admin/tracks">已发布曲目</a></nav>
 <h1>审核详情 <%= it.ingest.track_id %></h1>
 <div id="detail-main">
-<p>状态：<%= it.ingest.state === 'approved' ? '已审核' : it.ingest.state === 'rejected' ? '已拒' : it.ingest.state === 'revoked' ? '已下架' : 'pending' %></p>
-<h2>元数据</h2>
-<table>
-<% for (const k of ["title","artist","album","durationMs","coverUrl","format","bitrate","isrc","license","regionPolicy"]) { %>
-<tr><th><%= k %></th><td><%= it.ingest.meta[k] != null ? it.ingest.meta[k] : '未提供' %></td></tr>
-<% } %>
-</table>
-<h2>试听</h2>
-<div hx-get="/admin/ingest/<%= it.ingest.id %>/audio" hx-trigger="load" hx-swap="innerHTML">试听加载中…</div>
-<h2>审核历史</h2>
-<% if (it.history.length === 0) { %>
-<p>暂无审核记录</p>
-<% } else { %>
-<table>
-<tr><th>时间</th><th>操作人</th><th>动作</th><th>理由</th></tr>
-<% it.history.forEach(h => { %>
-<tr><td><%= h.at %></td><td><%= h.actor %></td><td><%= h.action %></td><td><%= h.reason != null ? h.reason : '' %></td></tr>
-<% }) %>
-</table>
-<% } %>
-<h2>操作</h2>
-<% if (it.ingest.state === 'pending') { %>
-<button hx-post="/admin/ingest/<%= it.ingest.id %>/approve" hx-target="body" hx-swap="innerHTML">approve</button>
-<form hx-post="/admin/ingest/<%= it.ingest.id %>/reject" hx-target="body" hx-swap="innerHTML">
-<textarea name="reason" maxlength="1000" placeholder="拒绝理由（可选）"></textarea>
-<button type="submit">reject</button>
-</form>
-<% } else if (it.ingest.state === 'approved') { %>
-<form hx-post="/admin/ingest/<%= it.ingest.id %>/revoke" hx-target="body" hx-swap="innerHTML">
-<textarea name="reason" maxlength="1000" placeholder="下架理由（可选）"></textarea>
-<button type="submit">revoke</button>
-</form>
-<% } else { %>
-<p>当前状态无可用操作</p>
-<% } %>
+<%~ it.main %>
 </div>
-</body></html>

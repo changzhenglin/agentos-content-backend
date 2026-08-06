@@ -1,6 +1,4 @@
-<!doctype html><html><head><meta charset="utf-8"><script src="/public/htmx.min.js"></script><script>htmx.config.responseHandling = [{ code: ".*", swap: true }];</script></head><body>
-<nav><a href="/admin/ingests">待审核</a> | <a href="/admin/tracks">已发布曲目</a></nav>
 <h1>已发布 tracks</h1>
 <table><tr><th>track_id</th><th>title</th><th>artist</th></tr>
 <% it.tracks.forEach(t => { %><tr><td><%= t.track_id %></td><td><%= t.title %></td><td><%= t.artist %></td></tr><% }) %>
-</table></body></html>
+</table>

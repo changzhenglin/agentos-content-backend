@@ -35,6 +35,7 @@ import {
   renderAudio,
   renderQueuePage,
   renderDetailPage,
+  renderDetailMain,
   renderTransitionError,
 } from "./admin/views.js";
 
@@ -423,7 +424,8 @@ export async function buildOpsApp(opts: BuildOpsAppOpts) {
 
     // approve/reject/revoke：operator 门放宽（spec D5：admin+operator 可审）；
     // reason 可选（≤1000 字符）；NOT_FOUND→404 JSON（M2b fix #2 先例保持）；
-    // INVALID_TRANSITION→409 / REASON_TOO_LONG→400 返 HTML partial
+    // 成功→detail-main partial（swap 锚点 #detail-main，原地刷新不嵌套整页，
+    // fold T2 follow-up ③）；INVALID_TRANSITION→409 / REASON_TOO_LONG→400 返 HTML partial
     //（htmx 2.0.4 默认 4xx 不 swap，页面 head responseHandling 配置 T5 加；
     // fold codex P1-2）。
     const transitionRoute = (action: "approve" | "reject" | "revoke") =>
@@ -491,7 +493,9 @@ export async function buildOpsApp(opts: BuildOpsAppOpts) {
               .code(404)
               .send(errBody("NOT_FOUND", "ingest not found"));
           }
-          return reply.type("text/html").send(renderDetailPage(detail));
+          // 成功响应 = #detail-main 内部内容 partial（非整页）：
+          // 详情页按钮/表单 hx-target="#detail-main"，innerHTML swap 原地刷新
+          return reply.type("text/html").send(renderDetailMain(detail));
         },
       );
     transitionRoute("approve");
