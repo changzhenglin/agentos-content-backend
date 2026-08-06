@@ -4,11 +4,11 @@
 
 **Goal:** 给 ContentDb port 增加回调式事务能力（withTransaction），把审核状态机的 CAS+审计行+tracks 投影包进同一数据库事务，根治 PR#12 codex P1（进程内并发交错产生「revoked 但曲目仍发布」第三态）。
 
-**Architecture:** 类型分层 Queryable ⊂ ContentDb ⊂ TransactionalContentDb（ContentDb 结构不变，既有消费者零感知）；生产实现 wrapPgPool 用 pool.connect() 专用连接保证 BEGIN→回调→COMMIT/ROLLBACK→release 全链同连接；正确性依赖 READ COMMITTED 行锁串行化 + CAS 条件重检（spec §5 论证）。
+**Architecture:** 类型分层 Queryable ⊂ ContentDb ⊂ TransactionalContentDb（ContentDb 结构不变，既有消费者零感知）；生产实现 wrapPgPool 用 pool.connect() 专用连接保证 BEGIN→回调→COMMIT/ROLLBACK→release 全链同连接；正确性依赖 READ COMMITTED 双机制：approve/revoke 对=已提交可见性串行化，approve/reject 对=行锁+CAS 条件重检（spec §5 论证，fold codex P1 修正归属）。
 
 **Tech Stack:** TypeScript ESM / fastify / vitest 2.1.9 / pg-mem 3.0.14（测试替身，无事务语义——spike 实证）/ pg ^8（生产）/ @testcontainers/postgresql ^12.0.4（Layer 3 真 pg 验收）。
 
-**Spec:** `docs/superpowers/specs/2026-08-06-review-projection-transaction-design.md`（commit `519ddcc`，D1-D7 冻结，review 不得重议）
+**Spec:** `docs/superpowers/specs/2026-08-06-review-projection-transaction-design.md`（base `519ddcc` + Eng/codex 两轮 review fold 修正 `d55a219`/`88e7988`；D1-D7 冻结，review 不得重议）
 
 ## Global Constraints
 
@@ -47,7 +47,7 @@ ln -s /Users/lcz/projects/AgentOS /Users/lcz/projects/agentos-content-backend/.c
 Run: `pnpm test`
 Expected: 269 passed / 29 skipped；4 个既有环境依赖失败文件集合与 Global Constraints 所列一致。记录实际数字到 report（后续每 task 只增不减的锚点）。`pnpm build` exit 0。
 
-- [ ] **Step 3: 写失败测试（Layer 1 契约，5 用例）**
+- [ ] **Step 3: 写失败测试（Layer 1 契约，7 用例）**
 
 创建 `test/unit/db-transaction.test.ts`：
 
