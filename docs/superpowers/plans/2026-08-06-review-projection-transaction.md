@@ -373,8 +373,9 @@ describe("事务通道亲和（Layer 2）", () => {
     );
     rec.txQueries.length = 0; // 种子不计入
     await ingestTransitionAndAudit(db, undefined, "i1", "approve", "user:admin");
-    // trackId SELECT + CAS UPDATE + review INSERT + tracks INSERT = 4 句
-    expect(rec.txQueries.length).toBe(4);
+    // trackId SELECT + transition 内 fetchIngest SELECT + CAS UPDATE + review INSERT + tracks INSERT = 5 句
+    //（fold Eng review C：transition() 内部自带一句 fetchIngest SELECT——spec §4.3 SQL 零改动，不得砍）
+    expect(rec.txQueries.length).toBe(5);
     expect(rec.txQueries.some((q) => q.startsWith("UPDATE ingest"))).toBe(true);
     expect(rec.bypassDuringTx.length).toBe(0);
     const { rows } = await db.query("SELECT count(*)::int AS c FROM tracks");
@@ -404,7 +405,7 @@ describe("事务通道亲和（Layer 2）", () => {
 - [ ] **Step 2: 跑测试确认 RED**
 
 Run: `pnpm vitest run test/unit/review-tx-affinity.test.ts`
-Expected: FAIL——现 ingestTransitionAndAudit 不调 withTransaction，rec.txQueries.length=0 ≠ 4（2 用例红）。若出现编译错误（TransactionalContentDb 传入旧签名 ContentDb 参数应兼容，不应报错；若报错说明 Task 1 类型未落，先修）
+Expected: FAIL——现 ingestTransitionAndAudit 不调 withTransaction，rec.txQueries.length=0 ≠ 5（2 用例红）。若出现编译错误（TransactionalContentDb 传入旧签名 ContentDb 参数应兼容，不应报错；若报错说明 Task 1 类型未落，先修）
 
 - [ ] **Step 3: state-machine.ts 入参放宽（SQL 零改动）**
 
@@ -668,7 +669,8 @@ runSuite("审核投影事务化：真 pg 并发验收（Layer 3）", () => {
   let opCookie: string;
 
   beforeAll(async () => {
-    container = await new PostgreSqlContainer().start();
+    // 钉镜像对齐 seed.test.ts 先例（fold Eng review I：本机缓存命中 + spec §12 镜像决策显式落地）
+    container = await new PostgreSqlContainer("postgres:15-alpine").start();
     pool = new Pool({ connectionString: container.getConnectionUri() });
     await pool.query(INGEST_DDL);
     await pool.query(REVIEW_DDL);
@@ -694,7 +696,7 @@ runSuite("审核投影事务化：真 pg 并发验收（Layer 3）", () => {
     });
     const sc = r.headers["set-cookie"];
     opCookie = Array.isArray(sc) ? sc[0] : sc;
-  }, 120_000); // 镜像拉取/容器启动余量
+  }, 240_000); // 对齐 seed.test.ts 先例（fold Eng review I：镜像首次拉取余量）
 
   afterAll(async () => {
     if (app) await app.close();
@@ -725,9 +727,17 @@ runSuite("审核投影事务化：真 pg 并发验收（Layer 3）", () => {
       const id = `inga${round}`;
       const trackId = `self:a${round}`;
       await seedIngest(id, trackId, "pending");
+      // 0–5ms 随机 stagger 提高交错窗口命中率（fold Eng review M；参数选择记入 report）
+      const jitter = () => new Promise((r) => setTimeout(r, Math.floor(Math.random() * 6)));
       const [ap, rv] = await Promise.all([
-        app.inject({ method: "POST", url: `/admin/ingest/${id}/approve`, headers: { cookie: opCookie } }),
-        app.inject({ method: "POST", url: `/admin/ingest/${id}/revoke`, headers: { cookie: opCookie } }),
+        (async () => {
+          await jitter();
+          return app.inject({ method: "POST", url: `/admin/ingest/${id}/approve`, headers: { cookie: opCookie } });
+        })(),
+        (async () => {
+          await jitter();
+          return app.inject({ method: "POST", url: `/admin/ingest/${id}/revoke`, headers: { cookie: opCookie } });
+        })(),
       ]);
       expect(ap.statusCode).toBe(200); // pending 上 approve 无竞争者，恒成功
       const t = await terminal(id, trackId);
@@ -803,6 +813,11 @@ runSuite("审核投影事务化：真 pg 并发验收（Layer 3）", () => {
     await new Promise((r) => setTimeout(r, 50)); // 服务端断开检测余量
     st = await pool.query("SELECT state FROM ingest WHERE id='ingc'");
     expect(String(st.rows[0].state)).toBe("pending");
+    // 锁释放实证（fold Eng review M）：孤儿事务若仍持行锁此 UPDATE 将阻塞至超时；
+    // rowCount=1 即「断连检测+回滚完成+锁释放」三合一实证；随后恢复 pending 不污染用例间状态
+    const upd = await pool.query("UPDATE ingest SET state='approved' WHERE id='ingc'");
+    expect(upd.rowCount).toBe(1);
+    await pool.query("UPDATE ingest SET state='pending' WHERE id='ingc'");
   });
 });
 ```
@@ -830,5 +845,19 @@ git commit -m "test(review): 真 pg 并发验收（P1 回归/CAS 竞争零残留
 
 1. `pnpm test` 全量复跑：279 passed / 29 skipped / 4 既有环境失败集合不变（Docker 可用口径；不可用则 276+3skip 并注明）
 2. `pnpm build` exit 0
-3. Surgical scope 核对：`git diff main --stat` 对 File Structure——新增 3（src/db/transaction.ts / test/unit/db-transaction.test.ts / test/integration/review-projection-tx.e2e.test.ts）+ 改动 5（src/content/db.ts / src/review/state-machine.ts / src/admin/ingest.ts / src/ops-app.ts / test/integration/helpers.ts）+ 本计划文档；零清单外文件
+3. Surgical scope 核对：`git diff main --stat` 对 File Structure——新增 4（src/db/transaction.ts / test/unit/db-transaction.test.ts / test/unit/review-tx-affinity.test.ts / test/integration/review-projection-tx.e2e.test.ts）+ 改动 5（src/content/db.ts / src/review/state-machine.ts / src/admin/ingest.ts / src/ops-app.ts / test/integration/helpers.ts）+ 本计划文档；零清单外文件
 4. known holes 入 PR body（spec §10 三条）+ not-architecture-impact 声明（spec §11）
+
+---
+
+## Fold 记录 — Eng plan review（2026-08-06，fresh-context 同厂商，VERDICT=NEEDS_WORK 1C/2I/2M）
+
+| # | 严重度 | 位置 | 问题 | 处置 |
+|---|---|---|---|---|
+| 1 | C | Task 2 Step 1 approve 用例 | txQueries 断言 4 句少数一句——transition() 内部自带 fetchIngest SELECT，正确实现下恒为 5 句，GREEN 门不可达 | **fold**：断言改 `.toBe(5)` + 注释列 5 句构成 + Step 2 RED 期望同步改 0≠5 |
+| 2 | I | 收尾验证 #3 | surgical 清单漏 review-tx-affinity.test.ts（新增 3 实为 4）；spec §9.6 同源 drift | **fold**：收尾 #3 改新增 4；spec §9.6 同步修正（fixup commit）；PR body 标注此同步事实 |
+| 3 | I | Task 3 Step 1 beforeAll | 未钉镜像 + 120s timeout，偏离 seed.test.ts 先例（postgres:15-alpine + 240s），首次拉取叠加网络不稳会 FAIL 而非 skip | **fold**：`new PostgreSqlContainer("postgres:15-alpine")` + beforeAll 240_000 对齐先例 |
+| 4 | M | Task 3 Case A | 零延迟同时发双请求，交错窗口命中率低（spec §12 委托的延迟参数未落地） | **fold**：每轮两 inject 各加 0–5ms 随机 stagger，参数记入 report；Layer 2 亲和断言仍结构性兜底 |
+| 5 | M | Task 3 Case C2 | 零残留断言由 MVCC 保证，无法区分「已回滚」与「回滚未完成」，未验锁释放 | **fold**：追加经 pool 的 UPDATE rowCount=1 断言（孤儿事务持锁则阻塞超时）+ 恢复 pending |
+
+核实备注：finding 1 对照 state-machine.ts:71（transition 内 fetchIngest）属实；finding 3 对照 seed.test.ts:29/44（钉镜像+240s）属实；其余两项为有效强化。Eng 清单外取证均已说明理由（session.ts cookie 链/policy-store 构造期零查询/vitest.config include/调用点 `db: any` 兼容）。
