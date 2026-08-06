@@ -15,7 +15,8 @@ import Fastify, { type FastifyInstance } from "fastify";
 import cookiePlugin from "@fastify/cookie";
 import staticPlugin from "@fastify/static";
 import { resolve } from "node:path";
-import type { ContentDb } from "./content/db.js";
+import type { ContentDb, TransactionalContentDb } from "./content/db.js";
+import { wrapPgPool } from "./db/transaction.js";
 import type { PolicyEnvelope, PolicyStore } from "./policy/policy-store.js";
 import { createPolicyStore } from "./policy/policy-store.js";
 import type { AuditSink } from "./audit/audit-sink.js";
@@ -49,7 +50,7 @@ export interface TlsOpts {
 }
 
 export interface BuildOpsAppOpts {
-  db: ContentDb;
+  db: TransactionalContentDb;
   auditSink?: AuditSink; // I2 fix: 可选——CLI 默认 env.auditSinkPath 空串不 wire sink
   tlsOpts?: TlsOpts;
   policyStore?: PolicyStore;
@@ -531,11 +532,17 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   );
   const { Pool } = await import("pg");
   const pool = new Pool({ connectionString: env.dbUrl });
-  const db: ContentDb = {
-    async query(text: string, params?: unknown[]) {
-      return pool.query(text, params as any[]);
+  // 事务化 port（spec §4.5）：显式适配器包裹 pg Pool（params as any[] 对齐仓内既有姿势）
+  const db = wrapPgPool({
+    query: (text, params) => pool.query(text, params as any[]),
+    connect: async () => {
+      const c = await pool.connect();
+      return {
+        query: (text: string, params?: unknown[]) => c.query(text, params as any[]),
+        release: () => c.release(),
+      };
     },
-  };
+  });
   const s3 = createS3(
     env.s3.endpoint,
     env.s3.region,

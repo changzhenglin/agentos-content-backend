@@ -13,9 +13,10 @@
 // 记录）。按 brief 指示对齐 T5 ContentDb port（{query(text, params)}），生产由 T7
 // 注入 pg Pool，测试由 pg-mem 注入。参数化 SQL 在 pg-mem 与真实 Postgres 同路径，
 // 安全且可测。语义与 brief 完全一致。
+// 2026-08-06 事务化：入参放宽 Queryable，由 withTransaction 包裹调用（spec §4.3）；SQL 与语义零改动。
 
 import { randomUUID } from "node:crypto";
-import type { ContentDb } from "../content/db.js";
+import type { Queryable } from "../content/db.js";
 
 export type ReviewAction = "approve" | "reject" | "revoke" | "resubmit";
 
@@ -43,7 +44,7 @@ interface IngestRow {
 }
 
 async function fetchIngest(
-  db: ContentDb,
+  db: Queryable,
   ingestId: string,
 ): Promise<IngestRow | null> {
   const { rows } = await db.query(
@@ -62,7 +63,7 @@ async function fetchIngest(
 }
 
 export async function transition(
-  db: ContentDb,
+  db: Queryable,
   ingestId: string,
   action: ReviewAction,
   actor: string,

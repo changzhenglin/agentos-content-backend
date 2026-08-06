@@ -5,7 +5,7 @@
 // 满足 ContentDb port。schema 用 raw SQL CREATE（与 schema.test.ts 一致）。
 
 import { newDb } from "pg-mem";
-import type { ContentDb } from "../../src/content/db.js";
+import type { ContentDb, Queryable, TransactionalContentDb } from "../../src/content/db.js";
 
 const TRACKS_DDL = `CREATE TABLE tracks (
   track_id text PRIMARY KEY,
@@ -83,13 +83,20 @@ export interface SeedTrack {
   license: string;
 }
 
-export function createTestDb(opts: { withLyrics?: boolean; withIngest?: boolean } = {}): ContentDb {
+export function createTestDb(opts: { withLyrics?: boolean; withIngest?: boolean } = {}): TransactionalContentDb {
   const mem = newDb();
   const pg = mem.adapters.createPg();
   const pool = new pg.Pool();
-  const db: ContentDb = {
+  const db: TransactionalContentDb = {
     async query(text: string, params?: unknown[]) {
       return pool.query(text, params as any[]);
+    },
+    // pg-mem 3.0.14 无事务语义（spec §8 spike 实证：ROLLBACK 不撤销、事务内写立即可见）——
+    // 直通实现仅满足 SQL 序列测试；回滚语义由 Layer 1 fake pool 契约 + Layer 3 真 pg 担当。
+    async withTransaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
+      return fn({
+        query: (text: string, params?: unknown[]) => pool.query(text, params as any[]),
+      });
     },
   };
   // 同步建表（pool.query 在 pg-mem 同步执行）
