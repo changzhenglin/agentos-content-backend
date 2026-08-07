@@ -4,6 +4,7 @@
 import { describe, it, expect } from "vitest";
 import { newDb } from "pg-mem";
 import type { TransactionalContentDb } from "../../src/content/db.js";
+import type { AuditSink } from "../../src/audit/audit-sink.js";
 import { ingestTransitionAndAudit } from "../../src/admin/ingest.js";
 
 // DDL 与 test/unit/review-state.test.ts 同源
@@ -86,6 +87,36 @@ function makeRecordingDb(): {
   return { db, rec };
 }
 
+function makeCommitRecordingDb(options: { rejectCommit?: boolean } = {}): {
+  db: TransactionalContentDb;
+  events: string[];
+} {
+  const { db: inner } = makeRecordingDb();
+  const events: string[] = [];
+  const db: TransactionalContentDb = {
+    query: (text, params) => inner.query(text, params),
+    async withTransaction(fn) {
+      const result = await inner.withTransaction(async (tx) => {
+        const value = await fn(tx);
+        events.push("callback");
+        return value;
+      });
+      if (options.rejectCommit) throw new Error("commit-rejected");
+      events.push("COMMIT");
+      return result;
+    },
+  };
+  return { db, events };
+}
+
+function makeRecordingAuditSink(events: string[]): AuditSink {
+  return {
+    async emit() {
+      events.push("emit");
+    },
+  };
+}
+
 describe("事务通道亲和（Layer 2）", () => {
   it("approve：全部语句经 tx 句柄，零 pool 旁路", async () => {
     const { db, rec } = makeRecordingDb();
@@ -102,6 +133,43 @@ describe("事务通道亲和（Layer 2）", () => {
     expect(rec.bypassDuringTx.length).toBe(0);
     const { rows } = await db.query("SELECT count(*)::int AS c FROM tracks");
     expect(Number(rows[0].c)).toBe(1);
+  });
+
+  it("approve：事务 callback→COMMIT 后才 emit audit", async () => {
+    const { db, events } = makeCommitRecordingDb();
+    await db.query(
+      "INSERT INTO ingest (id, track_id, source, raw_metadata, audio_object_key, state) VALUES ($1,$2,$3,$4,$5,'pending')",
+      ["i1", "self:t1", "admin-ui", META, "obj/k"],
+    );
+
+    await ingestTransitionAndAudit(
+      db,
+      makeRecordingAuditSink(events),
+      "i1",
+      "approve",
+      "user:admin",
+    );
+
+    expect(events).toEqual(["callback", "COMMIT", "emit"]);
+  });
+
+  it("approve：COMMIT reject 时函数 reject 且零 emit", async () => {
+    const { db, events } = makeCommitRecordingDb({ rejectCommit: true });
+    await db.query(
+      "INSERT INTO ingest (id, track_id, source, raw_metadata, audio_object_key, state) VALUES ($1,$2,$3,$4,$5,'pending')",
+      ["i1", "self:t1", "admin-ui", META, "obj/k"],
+    );
+
+    await expect(
+      ingestTransitionAndAudit(
+        db,
+        makeRecordingAuditSink(events),
+        "i1",
+        "approve",
+        "user:admin",
+      ),
+    ).rejects.toThrow("commit-rejected");
+    expect(events).toEqual(["callback"]);
   });
 
   it("revoke：全部语句经 tx 句柄（含 tracks DELETE）", async () => {
