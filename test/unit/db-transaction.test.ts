@@ -100,6 +100,27 @@ describe("wrapPgPool 契约（Layer 1）", () => {
     expect(released.length).toBe(1);
   });
 
+  it("connect 失败：原错误透传且回调不执行", async () => {
+    const connectError = new Error("connect-unavailable");
+    let fnRan = false;
+    const pool: PgPoolLike = {
+      async query() {
+        return { rows: [] };
+      },
+      async connect() {
+        throw connectError;
+      },
+    };
+    const db = wrapPgPool(pool);
+
+    await expect(
+      db.withTransaction(async () => {
+        fnRan = true;
+      }),
+    ).rejects.toBe(connectError);
+    expect(fnRan).toBe(false);
+  });
+
   it("非事务 query() 仍走 pool.query（既有行为零变化）", async () => {
     const { pool, poolQueries, clients } = fakePool();
     const db = wrapPgPool(pool);
