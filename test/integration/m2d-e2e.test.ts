@@ -396,7 +396,7 @@ describe("m2d e2e (D9 全链)", { skip: !dockerAvailable() }, () => {
   it("D9#5: 越权 ^backend:foo + cloud-ext caller → 403 BLOCKED + audit unauthorized (source_not_allowed)", async () => {
     // cloud-ext caller 仅允许 ^cloud: 源；^backend: 是 content-backend internal source，
     // 从 HTTP inbound（cloud-ext caller）进来 → receiveAndAuthorize source_not_allowed →
-    // 403 BLOCKED AUTH_FAILED + audit unauthorized（reason 进 traceId 语义）
+    // 403 BLOCKED AUTH_FAILED + audit unauthorized（reason 独立字段+traceId 入站透传）
     const r = await fetch(`${backendUrl}/content_query`, {
       method: "POST",
       headers: {
@@ -412,12 +412,15 @@ describe("m2d e2e (D9 全链)", { skip: !dockerAvailable() }, () => {
     expect(body.completion_state).toBe("BLOCKED");
     expect(body.error_code).toBe("AUTH_FAILED");
 
-    // audit unauthorized：emitUnauthorized 复用 tool_call event_type，
-    // reason 进 traceId 语义（traceId() + "|unauthorized:source_not_allowed"）
+    // audit unauthorized：emitUnauthorized 复用 tool_call event_type，reason 为独立结构化字段。
+    // M3 可观测 D2：traceId 只使用入站值透传（禁覆盖/不嵌入），不再用老格式
+    // traceId() + "|unauthorized:<reason>"（该格式已随 M3 可观测 land 废弃）。
     await new Promise((res) => setTimeout(res, 300));
     expect(existsSync(auditPath)).toBe(true);
     const audit = readFileSync(auditPath, "utf8");
-    expect(audit).toContain("unauthorized:source_not_allowed");
+    expect(audit).toContain('"reason":"source_not_allowed"');
+    // D2 透传：入站 x-trace-id 原样进 audit，不被生成值覆盖
+    expect(audit).toContain('"traceId":"trace-d9-5"');
     expect(audit).toContain("secret_handle:^backend:foo");
     expect(audit).toContain('"actor":"cloud-ext"');
   });
